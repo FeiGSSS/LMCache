@@ -551,6 +551,13 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
     def to_gpu(self, memory_obj: MemoryObj, start: int, end: int, **kwargs):
         assert memory_obj.raw_tensor is not None
         assert "slot_mapping" in kwargs
+
+        if getattr(memory_obj.metadata, "is_quantized", False):
+            raise NotImplementedError(
+                "Quantized KV retrieval is not supported for this connector. "
+                "Use VLLMPagedMemGPUConnectorV2 with vLLM."
+            )
+
         if self.use_mla:
             assert memory_obj.metadata.fmt == MemoryFormat.KV_MLA_FMT
         else:
@@ -901,6 +908,11 @@ class VLLMBufferLayerwiseGPUConnector(GPUConnectorInterface):
                     for start, end, memory_obj in zip(
                         starts, ends, memory_objs_layer, strict=False
                     ):
+                        if getattr(memory_obj.metadata, "is_quantized", False):
+                            raise NotImplementedError(
+                                "Quantized KV retrieval is not supported for this connector. "
+                                "Use VLLMPagedMemGPUConnectorV2 with vLLM."
+                            )
                         assert memory_obj.metadata.fmt == MemoryFormat.KV_2TD
                         assert load_gpu_buffer_obj.tensor is not None
                         load_gpu_buffer_obj.tensor[0][
@@ -1255,6 +1267,11 @@ class VLLMPagedMemLayerwiseGPUConnector(GPUConnectorInterface):
                 for start, end, memory_obj in zip(
                     starts, ends, memory_objs_layer, strict=False
                 ):
+                    if getattr(memory_obj.metadata, "is_quantized", False):
+                        raise NotImplementedError(
+                            "Quantized KV retrieval is not supported for this connector. "
+                            "Use VLLMPagedMemGPUConnectorV2 with vLLM."
+                        )
                     # Validate memory format
                     if self.use_mla:
                         assert memory_obj.metadata.fmt == MemoryFormat.KV_MLA_FMT, (
@@ -1516,6 +1533,12 @@ class SGLangGPUConnector(GPUConnectorInterface):
         """
         assert memory_obj.tensor is not None
 
+        if getattr(memory_obj.metadata, "is_quantized", False):
+            raise NotImplementedError(
+                "Quantized KV retrieval is not supported for this connector. "
+                "Use VLLMPagedMemGPUConnectorV2 with vLLM."
+            )
+
         if self.use_mla:
             if memory_obj.metadata.fmt != MemoryFormat.KV_MLA_FMT:
                 raise ValueError(
@@ -1764,6 +1787,11 @@ class SGLangLayerwiseGPUConnector(GPUConnectorInterface):
             for start, end, memory_obj in zip(
                 starts, ends, memory_objs_layer, strict=False
             ):
+                if getattr(memory_obj.metadata, "is_quantized", False):
+                    raise NotImplementedError(
+                        "Quantized KV retrieval is not supported for this connector. "
+                        "Use VLLMPagedMemGPUConnectorV2 with vLLM."
+                    )
                 assert memory_obj.metadata.fmt == MemoryFormat.KV_T2D
                 if self.use_gpu:
                     tmp_gpu_buffer_obj.tensor[start - offset : end - offset].copy_(

@@ -6,6 +6,7 @@
 #include <ATen/ATen.h>
 #include <ATen/Dispatch.h>
 #include <ATen/cuda/CUDAContext.h>
+#include <limits>
 #ifdef USE_ROCM
   #include <hip/hip_fp8.h>
 #else
@@ -563,65 +564,6 @@ __device__ __forceinline__ int unpack_int32_lowbit(const int32_t code,
   return (code >> (idx_in_pack * bits)) & mask;
 }
 
-template <typename scalar_t>
-__global__ void dequantize_and_store_multi_layer_kernel(
-    const int32_t* __restrict__ k_encoded,  // [L, T_packed, D]
-    const scalar_t* __restrict__ k_scale,   // [L, T/group, 1, D]
-    const scalar_t* __restrict__ k_mn,      // [L, T/group, 1, D]
-    const int32_t* __restrict__ v_encoded,  // [L, T_packed, D]
-    const scalar_t* __restrict__ v_scale,   // [L, T, D/group, 1]
-    const scalar_t* __restrict__ v_mn,      // [L, T, D/group, 1]
-    scalar_t** __restrict__ paged_buffer_ptrs,  // [num_layers] * [2,
-                                                // PAGE_BUFFER_SIZE, D]
-  const int64_t* __restrict__ slot_mapping,   // [num_tokens]
-    const int T_packed, const int D, const int num_tokens,
-    const int num_layers, const int page_buffer_size, const int bits,
-    const int group_size) {
-  const int token_id = blockIdx.x;
-  const int layer_id = blockIdx.y;
-  const int k_or_v = blockIdx.z;
-
-  const int64_t slot_idx = slot_mapping[token_id];
-  if (slot_idx < 0) {
-    return;
-  }
-
-  const int feat_per_int = 32 / bits;
-  const int packed_t = token_id / feat_per_int;
-  const int idx_in_pack = token_id - packed_t * feat_per_int;
-
-  scalar_t* paged_buffer_ptr = paged_buffer_ptrs[layer_id];
-
-  for (int d = threadIdx.x; d < D; d += blockDim.x) {
-    const int32_t code =
-        (k_or_v == 0)
-            ? k_encoded[(layer_id * T_packed + packed_t) * D + d]
-            : v_encoded[(layer_id * T_packed + packed_t) * D + d];
-    const int q = unpack_int32_lowbit(code, bits, idx_in_pack);
-
-    float scale_f;
-    float mn_f;
-    if (k_or_v == 0) {
-      const int t_group = token_id / group_size;
-      const int idx = (layer_id * (num_tokens / group_size) + t_group) * D + d;
-      scale_f = static_cast<float>(k_scale[idx]);
-      mn_f = static_cast<float>(k_mn[idx]);
-    } else {
-      const int d_group = d / group_size;
-      const int v_groups = D / group_size;
-      const int idx = (layer_id * num_tokens + token_id) * v_groups + d_group;
-      scale_f = static_cast<float>(v_scale[idx]);
-      mn_f = static_cast<float>(v_mn[idx]);
-    }
-
-    const float x = static_cast<float>(q) * scale_f + mn_f;
-    const int64_t vllm_offset =
-        page_buffer_offset(k_or_v, static_cast<int>(slot_idx), d, D,
-                           page_buffer_size);
-    paged_buffer_ptr[vllm_offset] = static_cast<scalar_t>(x);
-  }
-}
-
 template <typename scalar_t, typename index_t>
 __global__ void dequantize_and_store_multi_layer_kernel_indexed(
     const int32_t* __restrict__ k_encoded,  // [L, T_packed, D]
@@ -642,6 +584,11 @@ __global__ void dequantize_and_store_multi_layer_kernel_indexed(
 
   const int64_t slot_idx = static_cast<int64_t>(slot_mapping[token_id]);
   if (slot_idx < 0) {
+    return;
+  }
+  // slot_idx is used as an int in page_buffer_offset; guard against
+  // truncation and out-of-bounds writes.
+  if (slot_idx >= static_cast<int64_t>(page_buffer_size)) {
     return;
   }
 
@@ -720,6 +667,9 @@ void multi_layer_kv_transfer_dequantize(
   TORCH_CHECK(bits == 2 || bits == 4 || bits == 8,
               "bits must be one of {2,4,8}");
   TORCH_CHECK(group_size > 0, "group_size must be positive");
+  TORCH_CHECK(page_buffer_size > 0, "page_buffer_size must be positive");
+  TORCH_CHECK(page_buffer_size <= std::numeric_limits<int>::max(),
+              "page_buffer_size must be <= INT_MAX");
 
   TORCH_CHECK(key_value_ptrs.is_cuda(), "key_value_ptrs must be a CUDA tensor");
   TORCH_CHECK(key_value_ptrs.scalar_type() == at::kLong,

@@ -267,6 +267,11 @@ async def async_quantize_and_put(
         - 覆盖 `slot_mapping` 的 `torch.int32` / `torch.int64` 两种 dtype。
         - 验证 quantized path 的“GPU 反量化 + 写入 paged KV”与 Python 参考 `dequantize_cache` 一致（fp16 容差 `atol=2e-3`）。
 
+    ### 安全性加固（Review follow-up）
+
+    - CUDA kernel 增加 `slot_idx` 越界保护（`slot_idx >= page_buffer_size` 直接 return），避免潜在截断/OOB 写。
+    - 非 vLLM paged connector（除 `VLLMPagedMemGPUConnectorV2` 外）在 `to_gpu/batched_to_gpu` 入口处遇到 `is_quantized=True` 会直接 `NotImplementedError`，防止 silent data corruption。
+
     memory_obj: MemoryObj,
     on_complete_callback: Callable[[CacheEngineKey], None] = None,
 ):
