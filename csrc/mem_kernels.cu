@@ -4,6 +4,7 @@
 #include <c10/cuda/CUDAGuard.h>
 #include "mem_kernels.cuh"
 #include <ATen/ATen.h>
+#include <ATen/Dispatch.h>
 #include <ATen/cuda/CUDAContext.h>
 #ifdef USE_ROCM
   #include <hip/hip_fp8.h>
@@ -551,6 +552,258 @@ void multi_layer_kv_transfer_unilateral(
                                      num_layers, page_buffer_size);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
   }
+}
+
+namespace lmc {
+
+__device__ __forceinline__ int unpack_int32_lowbit(const int32_t code,
+                                                   const int bits,
+                                                   const int idx_in_pack) {
+  const int mask = (1 << bits) - 1;
+  return (code >> (idx_in_pack * bits)) & mask;
+}
+
+template <typename scalar_t>
+__global__ void dequantize_and_store_multi_layer_kernel(
+    const int32_t* __restrict__ k_encoded,  // [L, T_packed, D]
+    const scalar_t* __restrict__ k_scale,   // [L, T/group, 1, D]
+    const scalar_t* __restrict__ k_mn,      // [L, T/group, 1, D]
+    const int32_t* __restrict__ v_encoded,  // [L, T_packed, D]
+    const scalar_t* __restrict__ v_scale,   // [L, T, D/group, 1]
+    const scalar_t* __restrict__ v_mn,      // [L, T, D/group, 1]
+    scalar_t** __restrict__ paged_buffer_ptrs,  // [num_layers] * [2,
+                                                // PAGE_BUFFER_SIZE, D]
+  const int64_t* __restrict__ slot_mapping,   // [num_tokens]
+    const int T_packed, const int D, const int num_tokens,
+    const int num_layers, const int page_buffer_size, const int bits,
+    const int group_size) {
+  const int token_id = blockIdx.x;
+  const int layer_id = blockIdx.y;
+  const int k_or_v = blockIdx.z;
+
+  const int64_t slot_idx = slot_mapping[token_id];
+  if (slot_idx < 0) {
+    return;
+  }
+
+  const int feat_per_int = 32 / bits;
+  const int packed_t = token_id / feat_per_int;
+  const int idx_in_pack = token_id - packed_t * feat_per_int;
+
+  scalar_t* paged_buffer_ptr = paged_buffer_ptrs[layer_id];
+
+  for (int d = threadIdx.x; d < D; d += blockDim.x) {
+    const int32_t code =
+        (k_or_v == 0)
+            ? k_encoded[(layer_id * T_packed + packed_t) * D + d]
+            : v_encoded[(layer_id * T_packed + packed_t) * D + d];
+    const int q = unpack_int32_lowbit(code, bits, idx_in_pack);
+
+    float scale_f;
+    float mn_f;
+    if (k_or_v == 0) {
+      const int t_group = token_id / group_size;
+      const int idx = (layer_id * (num_tokens / group_size) + t_group) * D + d;
+      scale_f = static_cast<float>(k_scale[idx]);
+      mn_f = static_cast<float>(k_mn[idx]);
+    } else {
+      const int d_group = d / group_size;
+      const int v_groups = D / group_size;
+      const int idx = (layer_id * num_tokens + token_id) * v_groups + d_group;
+      scale_f = static_cast<float>(v_scale[idx]);
+      mn_f = static_cast<float>(v_mn[idx]);
+    }
+
+    const float x = static_cast<float>(q) * scale_f + mn_f;
+    const int64_t vllm_offset =
+        page_buffer_offset(k_or_v, static_cast<int>(slot_idx), d, D,
+                           page_buffer_size);
+    paged_buffer_ptr[vllm_offset] = static_cast<scalar_t>(x);
+  }
+}
+
+template <typename scalar_t, typename index_t>
+__global__ void dequantize_and_store_multi_layer_kernel_indexed(
+    const int32_t* __restrict__ k_encoded,  // [L, T_packed, D]
+    const scalar_t* __restrict__ k_scale,   // [L, T/group, 1, D]
+    const scalar_t* __restrict__ k_mn,      // [L, T/group, 1, D]
+    const int32_t* __restrict__ v_encoded,  // [L, T_packed, D]
+    const scalar_t* __restrict__ v_scale,   // [L, T, D/group, 1]
+    const scalar_t* __restrict__ v_mn,      // [L, T, D/group, 1]
+    scalar_t** __restrict__ paged_buffer_ptrs,  // [num_layers] * [2,
+                                                // PAGE_BUFFER_SIZE, D]
+    const index_t* __restrict__ slot_mapping,   // [num_tokens]
+    const int T_packed, const int D, const int num_tokens,
+    const int num_layers, const int page_buffer_size, const int bits,
+    const int group_size) {
+  const int token_id = blockIdx.x;
+  const int layer_id = blockIdx.y;
+  const int k_or_v = blockIdx.z;
+
+  const int64_t slot_idx = static_cast<int64_t>(slot_mapping[token_id]);
+  if (slot_idx < 0) {
+    return;
+  }
+
+  const int feat_per_int = 32 / bits;
+  const int packed_t = token_id / feat_per_int;
+  const int idx_in_pack = token_id - packed_t * feat_per_int;
+
+  scalar_t* paged_buffer_ptr = paged_buffer_ptrs[layer_id];
+
+  for (int d = threadIdx.x; d < D; d += blockDim.x) {
+    const int32_t code =
+        (k_or_v == 0)
+            ? k_encoded[(layer_id * T_packed + packed_t) * D + d]
+            : v_encoded[(layer_id * T_packed + packed_t) * D + d];
+    const int q = unpack_int32_lowbit(code, bits, idx_in_pack);
+
+    float scale_f;
+    float mn_f;
+    if (k_or_v == 0) {
+      const int t_group = token_id / group_size;
+      const int idx = (layer_id * (num_tokens / group_size) + t_group) * D + d;
+      scale_f = static_cast<float>(k_scale[idx]);
+      mn_f = static_cast<float>(k_mn[idx]);
+    } else {
+      const int d_group = d / group_size;
+      const int v_groups = D / group_size;
+      const int idx = (layer_id * num_tokens + token_id) * v_groups + d_group;
+      scale_f = static_cast<float>(v_scale[idx]);
+      mn_f = static_cast<float>(v_mn[idx]);
+    }
+
+    const float x = static_cast<float>(q) * scale_f + mn_f;
+    const int64_t vllm_offset =
+        page_buffer_offset(k_or_v, static_cast<int>(slot_idx), d, D,
+                           page_buffer_size);
+    paged_buffer_ptr[vllm_offset] = static_cast<scalar_t>(x);
+  }
+}
+
+}  // namespace lmc
+
+void multi_layer_kv_transfer_dequantize(
+    const torch::Tensor& k_encoded, const torch::Tensor& k_scale,
+    const torch::Tensor& k_mn, const torch::Tensor& v_encoded,
+    const torch::Tensor& v_scale, const torch::Tensor& v_mn,
+    const torch::Tensor& key_value_ptrs, const torch::Tensor& slot_mapping,
+    const torch::Device& paged_memory_device, const int page_buffer_size,
+    const int bits, const int group_size) {
+  // Allow encoded/scale/mn tensors to live on CUDA or pinned CPU.
+  // This matches the existing multi_layer_kv_transfer behavior: kernels can
+  // read from pinned host memory via UVA, avoiding an explicit staging copy.
+  TORCH_CHECK(k_encoded.is_cuda() || (k_encoded.is_cpu() && k_encoded.is_pinned()),
+              "k_encoded must be CUDA or pinned CPU");
+  TORCH_CHECK(v_encoded.is_cuda() || (v_encoded.is_cpu() && v_encoded.is_pinned()),
+              "v_encoded must be CUDA or pinned CPU");
+  TORCH_CHECK(k_scale.is_cuda() || (k_scale.is_cpu() && k_scale.is_pinned()),
+              "k_scale must be CUDA or pinned CPU");
+  TORCH_CHECK(k_mn.is_cuda() || (k_mn.is_cpu() && k_mn.is_pinned()),
+              "k_mn must be CUDA or pinned CPU");
+  TORCH_CHECK(v_scale.is_cuda() || (v_scale.is_cpu() && v_scale.is_pinned()),
+              "v_scale must be CUDA or pinned CPU");
+  TORCH_CHECK(v_mn.is_cuda() || (v_mn.is_cpu() && v_mn.is_pinned()),
+              "v_mn must be CUDA or pinned CPU");
+  TORCH_CHECK(k_encoded.scalar_type() == at::kInt,
+              "k_encoded must be int32");
+  TORCH_CHECK(v_encoded.scalar_type() == at::kInt,
+              "v_encoded must be int32");
+  TORCH_CHECK(k_encoded.is_contiguous() && v_encoded.is_contiguous(),
+              "encoded tensors must be contiguous");
+  TORCH_CHECK(k_scale.is_contiguous() && k_mn.is_contiguous() &&
+                  v_scale.is_contiguous() && v_mn.is_contiguous(),
+              "scale/mn tensors must be contiguous");
+  TORCH_CHECK(k_encoded.dim() == 3 && v_encoded.dim() == 3,
+              "encoded tensors must be 3D [L, T_packed, D]");
+
+  TORCH_CHECK(bits == 2 || bits == 4 || bits == 8,
+              "bits must be one of {2,4,8}");
+  TORCH_CHECK(group_size > 0, "group_size must be positive");
+
+  TORCH_CHECK(key_value_ptrs.is_cuda(), "key_value_ptrs must be a CUDA tensor");
+  TORCH_CHECK(key_value_ptrs.scalar_type() == at::kLong,
+              "key_value_ptrs must be int64 (torch.long)");
+  TORCH_CHECK(key_value_ptrs.is_contiguous(), "key_value_ptrs must be contiguous");
+
+  TORCH_CHECK(slot_mapping.is_cuda(), "slot_mapping must be a CUDA tensor");
+  TORCH_CHECK(slot_mapping.is_contiguous(), "slot_mapping must be contiguous");
+  TORCH_CHECK(slot_mapping.scalar_type() == at::kLong ||
+                  slot_mapping.scalar_type() == at::kInt,
+              "slot_mapping must be int64 (torch.long) or int32 (torch.int32)");
+
+  const int num_layers = static_cast<int>(k_encoded.size(0));
+  const int T_packed = static_cast<int>(k_encoded.size(1));
+  const int D = static_cast<int>(k_encoded.size(2));
+  const int feat_per_int = 32 / bits;
+  const int num_tokens = static_cast<int>(slot_mapping.size(0));
+
+  TORCH_CHECK(num_tokens == T_packed * feat_per_int,
+              "slot_mapping length must equal T_packed*(32/bits)");
+  TORCH_CHECK(num_tokens % group_size == 0,
+              "num_tokens must be divisible by group_size for K dequant");
+  TORCH_CHECK(D % group_size == 0,
+              "D must be divisible by group_size for V dequant");
+
+  const int expected_k_groups = num_tokens / group_size;
+  TORCH_CHECK(k_scale.dim() == 4 && k_scale.size(0) == num_layers &&
+                  k_scale.size(1) == expected_k_groups && k_scale.size(2) == 1 &&
+                  k_scale.size(3) == D,
+              "k_scale must be [L, T/group, 1, D]");
+  TORCH_CHECK(k_mn.sizes() == k_scale.sizes(), "k_mn must match k_scale");
+
+  const int expected_v_groups = D / group_size;
+  TORCH_CHECK(v_scale.dim() == 4 && v_scale.size(0) == num_layers &&
+                  v_scale.size(1) == num_tokens &&
+                  v_scale.size(2) == expected_v_groups && v_scale.size(3) == 1,
+              "v_scale must be [L, T, D/group, 1]");
+  TORCH_CHECK(v_mn.sizes() == v_scale.sizes(), "v_mn must match v_scale");
+
+  const at::cuda::OptionalCUDAGuard device_guard(paged_memory_device);
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+      at::ScalarType::Half, at::ScalarType::BFloat16, k_scale.scalar_type(),
+      "multi_layer_kv_transfer_dequantize", [&] {
+        const int32_t* k_encoded_ptr =
+            get_kernel_ptr<const int32_t, const torch::Tensor>(k_encoded);
+        const int32_t* v_encoded_ptr =
+            get_kernel_ptr<const int32_t, const torch::Tensor>(v_encoded);
+        const scalar_t* k_scale_ptr =
+            get_kernel_ptr<const scalar_t, const torch::Tensor>(k_scale);
+        const scalar_t* k_mn_ptr =
+            get_kernel_ptr<const scalar_t, const torch::Tensor>(k_mn);
+        const scalar_t* v_scale_ptr =
+            get_kernel_ptr<const scalar_t, const torch::Tensor>(v_scale);
+        const scalar_t* v_mn_ptr =
+            get_kernel_ptr<const scalar_t, const torch::Tensor>(v_mn);
+        scalar_t** page_buffer_ptrs =
+            get_kernel_ptr<scalar_t*, const torch::Tensor>(key_value_ptrs);
+
+        dim3 grid(num_tokens, num_layers, 2);
+        dim3 block(256);
+
+        if (slot_mapping.scalar_type() == at::kLong) {
+          const int64_t* slot_mapping_ptr =
+            get_kernel_ptr<const int64_t, const torch::Tensor>(slot_mapping);
+          lmc::dequantize_and_store_multi_layer_kernel_indexed<scalar_t, int64_t>
+            <<<grid, block, 0, stream>>>(
+              k_encoded_ptr, k_scale_ptr, k_mn_ptr, v_encoded_ptr,
+              v_scale_ptr, v_mn_ptr, page_buffer_ptrs, slot_mapping_ptr,
+              T_packed, D, num_tokens, num_layers, page_buffer_size, bits,
+              group_size);
+        } else {
+          const int32_t* slot_mapping_ptr =
+            get_kernel_ptr<const int32_t, const torch::Tensor>(slot_mapping);
+          lmc::dequantize_and_store_multi_layer_kernel_indexed<scalar_t, int32_t>
+            <<<grid, block, 0, stream>>>(
+              k_encoded_ptr, k_scale_ptr, k_mn_ptr, v_encoded_ptr,
+              v_scale_ptr, v_mn_ptr, page_buffer_ptrs, slot_mapping_ptr,
+              T_packed, D, num_tokens, num_layers, page_buffer_size, bits,
+              group_size);
+        }
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+      });
 }
 
 void single_layer_kv_transfer(

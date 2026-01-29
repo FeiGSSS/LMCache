@@ -322,6 +322,57 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
 
         kv_cache_pointers = self._initialize_pointers(self.kvcaches)
 
+        # Quantized retrieval path: transfer quantized tensors to GPU first,
+        # then dequantize on GPU directly into vLLM paged KV cache.
+        if getattr(memory_obj.metadata, "is_quantized", False):
+            if self.use_mla:
+                raise NotImplementedError(
+                    "Quantized retrieval for MLA format is not supported yet."
+                )
+
+            bits = kwargs.get("kv_quantization_bits", None)
+            group_size = kwargs.get("kv_quantization_group_size", None)
+            if bits is None or group_size is None:
+                raise ValueError(
+                    "Missing kv quantization params in kwargs: "
+                    "kv_quantization_bits and kv_quantization_group_size"
+                )
+
+            k_encoded = memory_obj.get_tensor(0)
+            k_scale = memory_obj.get_tensor(1)
+            k_mn = memory_obj.get_tensor(2)
+            v_encoded = memory_obj.get_tensor(3)
+            v_scale = memory_obj.get_tensor(4)
+            v_mn = memory_obj.get_tensor(5)
+            if (
+                k_encoded is None
+                or k_scale is None
+                or k_mn is None
+                or v_encoded is None
+                or v_scale is None
+                or v_mn is None
+            ):
+                raise ValueError("Quantized MemoryObj missing one or more tensors")
+
+            # Quantized fast path: keep quantized tensors on CPU pinned (or CUDA)
+            # and let the CUDA op read them via UVA, then dequantize directly into
+            # vLLM paged KV cache.
+            with torch.cuda.stream(self.load_stream):
+                lmc_ops.multi_layer_kv_transfer(
+                    (k_encoded, k_scale, k_mn, v_encoded, v_scale, v_mn),
+                    kv_cache_pointers,
+                    slot_mapping[start:end],
+                    self.device,
+                    self.page_buffer_size,
+                    False,
+                    self.use_mla,
+                    quantized=True,
+                    bits=int(bits),
+                    group_size=int(group_size),
+                )
+
+            return
+
         lmc_ops.multi_layer_kv_transfer(
             memory_obj.tensor,
             kv_cache_pointers,

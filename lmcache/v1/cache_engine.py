@@ -787,6 +787,16 @@ class LMCacheEngine:
         # RDMA is another example.
         if len(reordered_chunks) > 0:
             with retrieve_stats.profile_to_gpu():
+                # If KV quantization is enabled, pass dequant params down to GPUConnector.
+                # Retrieval-side dequantization must use the same bits/group_size as store.
+                if getattr(self.config, "enable_kv_quantization", False):
+                    kwargs.setdefault(
+                        "kv_quantization_bits", self.config.kv_quantization_bits
+                    )
+                    kwargs.setdefault(
+                        "kv_quantization_group_size",
+                        self.config.kv_quantization_group_size,
+                    )
                 _, memory_objs, starts, ends = zip(*reordered_chunks, strict=False)
                 self.gpu_connector.batched_to_gpu(
                     list(memory_objs), list(starts), list(ends), **kwargs

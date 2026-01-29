@@ -25,6 +25,26 @@ void multi_layer_kv_transfer_unilateral(
     const torch::Tensor& slot_mapping, const torch::Device& paged_memory_device,
     const int page_buffer_size, const bool direction, const bool use_mla);
 
+// Dequantize quantized KV cache and write directly into vLLM paged memory.
+// Quantization format is KIVI-style produced by lmcache.v1.compute.quantization.quantize_cache:
+// - k_encoded/v_encoded: int32, shape [L, T_packed, D]
+// - k_scale/k_mn: float16/bf16, shape [L, T/group_size, 1, D]
+// - v_scale/v_mn: float16/bf16, shape [L, T, D/group_size, 1]
+// key_value_ptrs points to per-layer vLLM KV tensors of shape [2, PAGE_BUFFER_SIZE, D].
+void multi_layer_kv_transfer_dequantize(
+  const torch::Tensor& k_encoded,
+  const torch::Tensor& k_scale,
+  const torch::Tensor& k_mn,
+  const torch::Tensor& v_encoded,
+  const torch::Tensor& v_scale,
+  const torch::Tensor& v_mn,
+  const torch::Tensor& key_value_ptrs,
+  const torch::Tensor& slot_mapping,
+  const torch::Device& paged_memory_device,
+  const int page_buffer_size,
+  const int bits,
+  const int group_size);
+
 void single_layer_kv_transfer(torch::Tensor& lmc_key_value_cache,
                               torch::Tensor& vllm_key_value_cache,
                               torch::Tensor& slot_mapping, const bool direction,
