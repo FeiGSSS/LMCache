@@ -137,6 +137,9 @@ class MemoryObjMetadata:
     shapes: Optional[list[torch.Size]] = None
     dtypes: Optional[list[torch.dtype]] = None
 
+    # Whether the KV cache is quantized (for retrieval dequantization)
+    is_quantized: bool = False
+
     def to_dict(self):
         # Note(Kuntai): this is used for serializing MemoryObjMetadata via
         # msgpack.
@@ -150,6 +153,7 @@ class MemoryObjMetadata:
             "fmt": self.fmt.value,
             "shapes": [list(shape) for shape in self.shapes] if self.shapes else None,
             "dtypes": [str(dtype) for dtype in self.dtypes] if self.dtypes else None,
+            "is_quantized": self.is_quantized,
         }
 
     @staticmethod
@@ -164,6 +168,7 @@ class MemoryObjMetadata:
             if dtypes_list
             else None
         )
+        is_quantized = d.get("is_quantized", False)
         return MemoryObjMetadata(
             shape=torch.Size(d["shape"]),
             dtype=dtype,
@@ -173,6 +178,7 @@ class MemoryObjMetadata:
             fmt=MemoryFormat(d["fmt"]),
             shapes=shapes,
             dtypes=dtypes,
+            is_quantized=is_quantized,
         )
 
     def get_size(self) -> int:

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 from collections import OrderedDict
-from concurrent.futures import Future
+from concurrent.futures import Future, ThreadPoolExecutor
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -55,7 +55,7 @@ logger = init_logger(__name__)
 
 
 # Helper function to get the class name of the backend
-def get_backend_cname(backend: StorageBackendInterface):
+def get_backend_cname(backend: Any):
     return backend.__class__.__name__
 
 
@@ -64,7 +64,7 @@ def allocate_and_copy_objects(
     allocator_backend: AllocatorBackendInterface,
     keys: Sequence[CacheEngineKey],
     src_memory_objs: list[MemoryObj],
-    stream: torch.cuda.Stream,
+    stream: Optional[torch.cuda.Stream],
 ) -> tuple[Sequence[CacheEngineKey], list[MemoryObj]]:
     """
     Allocate the memory objects and copy the data from src_memory_objs to
@@ -86,9 +86,25 @@ def allocate_and_copy_objects(
     for key, src_memory_obj in zip(keys, src_memory_objs, strict=False):
         if allocator_backend.contains(key):
             continue
+
+        # Prefer multi-tensor shapes/dtypes when available.
+        try:
+            shapes = src_memory_obj.get_shapes()
+            dtypes = src_memory_obj.get_dtypes()
+        except Exception:
+            shapes = src_memory_obj.get_shape()
+            dtypes = src_memory_obj.get_dtype()
+
+        if dtypes is None:
+            logger.warning(
+                "Source MemoryObj has dtype=None; skipping allocation/copy for key %s",
+                key,
+            )
+            continue
+
         memory_obj = allocator_backend.allocate(
-            src_memory_obj.get_shape(),
-            src_memory_obj.get_dtype(),
+            shapes,
+            dtypes,
             fmt=src_memory_obj.meta.fmt,
             eviction=True,
             busy_loop=False,
@@ -97,22 +113,264 @@ def allocate_and_copy_objects(
         if memory_obj is None:
             break
 
-        if memory_obj.tensor is None:
-            # This should not happen with current implementation,
-            # but handle it defensively to avoid memory leak
-            logger.warning(
-                "Allocated MemoryObj has None tensor, this is unexpected. "
-                "Releasing the memory object."
-            )
-            memory_obj.ref_count_down()
-            break
+        # Preserve quantization marker for retrieval.
+        memory_obj.meta.is_quantized = src_memory_obj.metadata.is_quantized
 
-        with torch.cuda.stream(stream):
-            memory_obj.tensor.copy_(src_memory_obj.tensor, non_blocking=True)
+        # Copy data. If this is a multi-tensor MemoryObj, copy each tensor group.
+        try:
+            group_count = len(memory_obj.get_shapes())
+        except Exception:
+            group_count = 1
+
+        if group_count > 1:
+            for i in range(group_count):
+                dst_t = memory_obj.get_tensor(i)
+                src_t = src_memory_obj.get_tensor(i)
+                if dst_t is None or src_t is None:
+                    logger.warning(
+                        "Missing tensor group %d during copy; aborting key %s",
+                        i,
+                        key,
+                    )
+                    memory_obj.ref_count_down()
+                    memory_obj = None
+                    break
+                if stream is not None and (dst_t.is_cuda or src_t.is_cuda):
+                    with torch.cuda.stream(stream):
+                        dst_t.copy_(src_t, non_blocking=True)
+                else:
+                    dst_t.copy_(src_t)
+
+            if memory_obj is None:
+                break
+        else:
+            dst = memory_obj.tensor
+            src = src_memory_obj.tensor
+            if dst is None or src is None:
+                logger.warning(
+                    "Allocated or source MemoryObj has None tensor; aborting key %s",
+                    key,
+                )
+                memory_obj.ref_count_down()
+                break
+            if stream is not None and (dst.is_cuda or src.is_cuda):
+                with torch.cuda.stream(stream):
+                    dst.copy_(src, non_blocking=True)
+            else:
+                dst.copy_(src)
         allocated_objects.append(memory_obj)
 
-    stream.synchronize()
+    if stream is not None:
+        stream.synchronize()
     return keys[: len(allocated_objects)], allocated_objects
+
+
+def _quantize_memory_objects(
+    allocator_backend: AllocatorBackendInterface,
+    memory_objs: list[MemoryObj],
+    group_size: int,
+    bits: int,
+) -> list[MemoryObj]:
+    """
+    Quantize KV cache memory objects into multi-tensor format.
+
+    Args:
+        allocator_backend: the allocator backend to allocate the new
+          memory objects for quantized data
+        memory_objs: the memory objects containing KV cache to quantize
+        group_size: the group size for quantization
+        bits: the number of bits for quantization (2, 4, 8)
+
+    Returns:
+        list of quantized MemoryObjects (6 tensors each: k_encoded,
+        k_scale, k_mn, v_encoded, v_scale, v_mn)
+    """
+    from lmcache.v1.compute.quantization import quantize_cache
+
+    quantized_objs: list[MemoryObj] = []
+    for memory_obj in memory_objs:
+        tensor = memory_obj.tensor
+        if tensor is None:
+            logger.warning(
+                "MemoryObj.tensor is None; skipping KV quantization for this object"
+            )
+            quantized_objs.append(memory_obj)
+            continue
+
+        # Extract (K, V) based on MemoryFormat from metadata.
+        # The L dimension (num_layers) is treated as extra head dimension (nh)
+        # and passed directly to quantize_cache.
+        k_cache: Optional[torch.Tensor] = None
+        v_cache: Optional[torch.Tensor] = None
+        fmt = memory_obj.get_memory_format()
+        shape = tensor.shape
+
+        if fmt == MemoryFormat.KV_T2D:
+            # Shape: [2, L, T, D] or [2, T, D]
+            # First dim is 2 (K/V), rest is [..., T, D]
+            if shape[0] == 2:
+                k_cache = tensor[0]  # [..., T, D]
+                v_cache = tensor[1]  # [..., T, D]
+            else:
+                logger.warning(
+                    "KV_T2D format expects shape[0] == 2, got %s; skipping quantization",
+                    shape,
+                )
+        elif fmt == MemoryFormat.KV_2LTD:
+            # Shape: [L, 2, T, D] or [T, 2, D]
+            # Second dim is 2 (K/V), extract along dim=1
+            if shape[1] == 2:
+                if tensor.dim() == 4:
+                    k_cache = tensor[:, 0, :, :]  # [L, T, D]
+                    v_cache = tensor[:, 1, :, :]  # [L, T, D]
+                elif tensor.dim() == 3:
+                    k_cache = tensor[:, 0, :]  # [T, D]
+                    v_cache = tensor[:, 1, :]  # [T, D]
+                else:
+                    logger.warning(
+                        "KV_2LTD format expects 3D/4D tensor, got dim=%s; skipping quantization",
+                        tensor.dim(),
+                    )
+            else:
+                logger.warning(
+                    "KV_2LTD format expects shape[1] == 2, got %s; skipping quantization",
+                    shape,
+                )
+        elif fmt == MemoryFormat.KV_MLA_FMT:
+            # Shape: [1, L, T, D] or [2, L, T, D]
+            if shape[0] == 1:
+                # MLA with only K cache
+                k_cache = tensor[0]  # [L, T, D]
+                v_cache = None
+            elif shape[0] == 2:
+                # MLA with both K and V
+                k_cache = tensor[0]  # [L, T, D]
+                v_cache = tensor[1]  # [L, T, D]
+            else:
+                logger.warning(
+                    "KV_MLA_FMT format expects shape[0] in [1, 2], got %s; skipping quantization",
+                    shape,
+                )
+        elif fmt == MemoryFormat.KV_2TD:
+            # Compressed binary format - not supported for quantization yet
+            logger.debug(
+                "KV_2TD format not yet supported for quantization; skipping"
+            )
+        else:
+            logger.debug(
+                "MemoryFormat %s not supported for KV quantization; skipping",
+                fmt,
+            )
+
+        if k_cache is None or (v_cache is None and fmt == MemoryFormat.KV_MLA_FMT):
+            # MLA with only K cache: skip quantization for now
+            # TODO: Support K-only quantization for MLA
+            logger.debug(
+                "MLA format (K-only) not yet supported for quantization; skipping"
+            )
+            quantized_objs.append(memory_obj)
+            continue
+        elif k_cache is None or v_cache is None:
+            logger.warning(
+                "Unsupported KV tensor layout %s for fmt=%s; skipping quantization",
+                tuple(tensor.shape),
+                fmt,
+            )
+            quantized_objs.append(memory_obj)
+            continue
+
+        # quantize_cache expects [nh, T, D]. If we extracted [T, D], add nh=1.
+        if k_cache.dim() == 2:
+            k_cache = k_cache.unsqueeze(0)
+        if v_cache.dim() == 2:
+            v_cache = v_cache.unsqueeze(0)
+
+        # Now k_cache should be 3D [..., T, D] (where ... is head dims)
+        # quantize_cache treats the first dim as nh
+        if k_cache.dim() != 3 or v_cache.dim() != 3:
+            logger.warning(
+                "Unexpected KV dims after extraction (K=%s, V=%s); skipping quantization",
+                k_cache.dim(),
+                v_cache.dim(),
+            )
+            quantized_objs.append(memory_obj)
+            continue
+
+        # Quantize K cache (group along token dimension)
+        k_encoded, k_scale, k_mn = quantize_cache(k_cache, "k", group_size, bits)
+
+        # Quantize V cache (group along head_dim dimension)
+        v_encoded, v_scale, v_mn = quantize_cache(v_cache, "v", group_size, bits)
+
+        # Calculate shapes and dtypes for quantized tensors
+        shapes = [
+            k_encoded.shape,  # int32
+            k_scale.shape,    # float16
+            k_mn.shape,       # float16
+            v_encoded.shape,  # int32
+            v_scale.shape,    # float16
+            v_mn.shape,       # float16
+        ]
+        dtypes = [
+            torch.int32,
+            torch.float16,
+            torch.float16,
+            torch.int32,
+            torch.float16,
+            torch.float16,
+        ]
+
+        # Allocate new memory for quantized data
+        fmt = memory_obj.get_memory_format()
+        quantized_obj = allocator_backend.allocate(
+            shapes, dtypes, fmt=fmt, eviction=True, busy_loop=False
+        )
+
+        if quantized_obj is None:
+            logger.warning(
+                "Failed to allocate memory for quantized KV cache; falling back to original"
+            )
+            quantized_objs.append(memory_obj)
+            continue
+
+        # Mark as quantized for retrieval dequantization
+        quantized_obj.meta.is_quantized = True
+
+        # Copy quantized data
+        t0 = quantized_obj.get_tensor(0)
+        t1 = quantized_obj.get_tensor(1)
+        t2 = quantized_obj.get_tensor(2)
+        t3 = quantized_obj.get_tensor(3)
+        t4 = quantized_obj.get_tensor(4)
+        t5 = quantized_obj.get_tensor(5)
+        if (
+            t0 is None
+            or t1 is None
+            or t2 is None
+            or t3 is None
+            or t4 is None
+            or t5 is None
+        ):
+            logger.warning(
+                "Quantized MemoryObj has missing tensors; falling back to original"
+            )
+            quantized_obj.ref_count_down()
+            quantized_objs.append(memory_obj)
+            continue
+
+        t0.copy_(k_encoded)
+        t1.copy_(k_scale)
+        t2.copy_(k_mn)
+        t3.copy_(v_encoded)
+        t4.copy_(v_scale)
+        t5.copy_(v_mn)
+
+        # Release original memory object
+        memory_obj.ref_count_down()
+
+        quantized_objs.append(quantized_obj)
+
+    return quantized_objs
 
 
 class WeightedSemaphore:
@@ -293,6 +551,18 @@ class StorageManager:
             assert self.allocator_backend is not None
             self.async_serializer = AsyncSingleSerializer(self.loop)
 
+        # KV cache quantization config
+        self.enable_quantization = config.enable_kv_quantization
+        self.quantization_bits = config.kv_quantization_bits
+        self.quantization_group_size = config.kv_quantization_group_size
+
+        # Thread pool for CPU-bound quantization tasks (only if quantization enabled)
+        # Using explicit thread pool for better control over worker count
+        if self.enable_quantization:
+            self.quantize_executor = ThreadPoolExecutor(max_workers=4)
+        else:
+            self.quantize_executor = None
+
         self._setup_metrics()
 
     def _setup_metrics(self):
@@ -397,15 +667,45 @@ class StorageManager:
         storage backends.
         Do not store if the same object is being stored (handled here by
         storage manager) or has been stored (handled by storage backend).
+
+        If KV cache quantization is enabled, the memory objects will be
+        quantized before storing.
+        """
+        if not memory_objs:
+            return
+
+        if self.allocator_backend is None:
+            # For scheduler role, no allocator backend available
+            raise RuntimeError("Batched put not available for scheduler role")
+
+        if self.enable_quantization:
+            # Quantize and put asynchronously
+            self._batched_put_with_quantization(keys, memory_objs, transfer_spec, location)
+        else:
+            # Original batched_put implementation
+            self._batched_put_impl(keys, memory_objs, transfer_spec, location)
+
+    def _batched_put_impl(
+        self,
+        keys: Sequence[CacheEngineKey],
+        memory_objs: List[MemoryObj],
+        transfer_spec=None,
+        location: Optional[str] = None,
+    ) -> None:
+        """
+        Original batched_put implementation.
+
+        Args:
+            keys: the cache engine keys
+            memory_objs: the memory objects to store
+            transfer_spec: optional transfer specification
+            location: optional backend location filter
         """
         # The dictionary from backend cname to objects and keys
         obj_dict: dict[
             str,
             tuple[Sequence[CacheEngineKey], list[MemoryObj]],
         ] = {}
-        if self.allocator_backend is None:
-            # For scheduler role, no allocator backend available
-            raise RuntimeError("Batched put not available for scheduler role")
         obj_dict[get_backend_cname(self.allocator_backend)] = (
             keys,
             memory_objs,
@@ -434,7 +734,45 @@ class StorageManager:
 
         for cname, (ks, objs) in obj_dict.items():
             for memory_obj in objs:
-                memory_obj.ref_count_down()
+                if memory_obj is not None:
+                    memory_obj.ref_count_down()
+
+    def _batched_put_with_quantization(
+        self,
+        keys: Sequence[CacheEngineKey],
+        memory_objs: List[MemoryObj],
+        transfer_spec=None,
+        location: Optional[str] = None,
+    ) -> None:
+        """
+        Quantize and store KV cache asynchronously.
+
+        The quantization is CPU-bound, so we run it in an executor.
+        After quantization, the original batched_put_impl is called.
+
+        Args:
+            keys: the cache engine keys
+            memory_objs: the memory objects containing KV cache to quantize
+            transfer_spec: optional transfer specification
+            location: optional backend location filter
+        """
+        def quantize_and_put():
+            assert self.allocator_backend is not None
+            # Quantize all memory objects
+            quantized_objs = _quantize_memory_objects(
+                self.allocator_backend,
+                memory_objs,
+                self.quantization_group_size,
+                self.quantization_bits,
+            )
+
+            # Call original batched_put with (quantized or original) objects.
+            # _quantize_memory_objects falls back per-object, so lengths match.
+            self._batched_put_impl(keys, quantized_objs, transfer_spec, location)
+
+        # Submit quantization task to executor (non-blocking)
+        # Uses explicit ThreadPoolExecutor with 4 worker threads
+        self.loop.run_in_executor(self.quantize_executor, quantize_and_put)
 
     def get(
         self,
@@ -1117,6 +1455,12 @@ class StorageManager:
                 logger.info(f"Storage backend {name} closed successfully")
             except Exception as e:
                 logger.error(f"Error closing backend {name}: {e}")
+
+        # Shutdown quantization executor
+        if self.quantize_executor is not None:
+            logger.info("Shutting down quantize executor...")
+            self.quantize_executor.shutdown(wait=True)
+            logger.info("Quantize executor shut down successfully")
 
         # Stop event loop
         try:

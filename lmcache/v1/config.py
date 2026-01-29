@@ -434,6 +434,38 @@ _CONFIG_DEFINITIONS: dict[str, dict[str, Any]] = {
         "default": False,
         "env_converter": _to_bool,
     },
+    # KV Cache Quantization configurations
+    "enable_kv_quantization": {
+        "type": bool,
+        "default": False,
+        "env_converter": _to_bool,
+        "description": (
+            "Enable KV cache quantization using KIVI-style quantization. "
+            "When enabled, KV cache is quantized during store() before writing "
+            "to backend. Retrieve-side dequantization will be added in a future update."
+        ),
+    },
+    "kv_quantization_bits": {
+        "type": int,
+        "default": 4,
+        "env_converter": int,
+        "description": (
+            "Number of bits for KV cache quantization (2, 4, or 8). "
+            "Lower values provide higher compression but may impact accuracy. "
+            "Default is 4 bits."
+        ),
+    },
+    "kv_quantization_group_size": {
+        "type": int,
+        "default": 128,
+        "env_converter": int,
+        "description": (
+            "Group size for KV cache quantization. "
+            "K cache: grouped along token dimension (T). "
+            "V cache: grouped along head dimension (D). "
+            "Default is 128."
+        ),
+    },
     # TODO(chunxiaozheng): remove this after VLLMPagedMemGPUConnectorV3 is stable
     "use_gpu_connector_v3": {
         "type": bool,
@@ -552,6 +584,23 @@ def _validate_config(self):
         assert self.extra_config.get("nixl_pool_size") is not None
         assert self.nixl_buffer_size is not None
         assert self.nixl_buffer_device is not None
+
+    # Validate KV quantization configuration
+    if self.enable_kv_quantization:
+        if self.kv_quantization_bits not in [2, 4, 8]:
+            raise ValueError(
+                f"kv_quantization_bits must be 2, 4, or 8, "
+                f"got {self.kv_quantization_bits}"
+            )
+        if self.kv_quantization_group_size <= 0:
+            raise ValueError(
+                f"kv_quantization_group_size must be positive, "
+                f"got {self.kv_quantization_group_size}"
+            )
+        logger.info(
+            f"KV cache quantization enabled: {self.kv_quantization_bits}-bit, "
+            f"group_size={self.kv_quantization_group_size}"
+        )
 
     return self
 

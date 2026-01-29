@@ -324,6 +324,41 @@ def test_memory_obj_metadata_to_and_from_dict():
     assert metadata_from_dict_2.shapes == shapes
     assert metadata_from_dict_2.dtypes == dtypes
 
+    # Test is_quantized field serialization
+    metadata_quantized = MemoryObjMetadata(
+        shape=shape1,
+        dtype=dtype1,
+        address=0,
+        phy_size=0,
+        ref_count=0,
+        pin_count=0,
+        fmt=MemoryFormat.KV_T2D,
+        shapes=shapes,
+        dtypes=dtypes,
+        is_quantized=True,
+    )
+    dict_quantized = metadata_quantized.to_dict()
+    assert dict_quantized["is_quantized"] is True
+
+    metadata_from_dict_quantized = MemoryObjMetadata.from_dict(dict_quantized)
+    assert metadata_from_dict_quantized.is_quantized is True
+
+    # Test default is_quantized is False (for backward compatibility)
+    metadata_not_quantized = MemoryObjMetadata(
+        shape=shape1,
+        dtype=dtype1,
+        address=0,
+        phy_size=0,
+        ref_count=0,
+        pin_count=0,
+        fmt=MemoryFormat.KV_T2D,
+    )
+    dict_not_quantized = metadata_not_quantized.to_dict()
+    assert dict_not_quantized["is_quantized"] is False
+
+    metadata_from_dict_not_quantized = MemoryObjMetadata.from_dict(dict_not_quantized)
+    assert metadata_from_dict_not_quantized.is_quantized is False
+
 
 @pytest.mark.parametrize(
     "alloc_cls,custom_timeout,elapsed_time",
