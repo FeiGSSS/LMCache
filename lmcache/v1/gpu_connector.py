@@ -202,6 +202,10 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
         self.kvcaches: Optional[List[torch.Tensor]] = None
 
         self.gpu_buffer: Optional[torch.Tensor] = None
+        # Optional staging buffers for quantized tensors on GPU
+        self.quantized_gpu_buffers: Optional[list[torch.Tensor]] = None
+        self.quantized_gpu_buffer_shapes: Optional[list[torch.Size]] = None
+        self.quantized_gpu_buffer_dtypes: Optional[list[torch.dtype]] = None
         self.use_mla = "use_mla" in kwargs and kwargs["use_mla"]
         if use_gpu:
             assert "chunk_size" in kwargs, (
@@ -294,36 +298,23 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
         :raises AssertionError: If the memory object does not have a tensor.
         :raises ValueError: If 'slot_mapping' is not provided in kwargs.
         """
-        assert memory_obj.tensor is not None
-
         self.initialize_kvcaches_ptr(**kwargs)
 
         assert self.kvcaches is not None, (
             "kvcaches should be provided in kwargs or initialized beforehand."
         )
 
-        if self.use_mla:
-            if memory_obj.metadata.fmt != MemoryFormat.KV_MLA_FMT:
-                raise ValueError(
-                    "The memory object should be in KV_MLA_FMT format in"
-                    " order to be processed by VLLMPagedMemGPUConnector"
-                )
-        else:
-            if memory_obj.metadata.fmt != MemoryFormat.KV_2LTD:
-                raise ValueError(
-                    "The memory object should be in KV_2LTD format in"
-                    " order to be processed by VLLMPagedMemGPUConnector"
-                )
-
         if "slot_mapping" not in kwargs:
             raise ValueError("'slot_mapping' should be provided in kwargs.")
 
         slot_mapping: torch.Tensor = kwargs["slot_mapping"]
-
         kv_cache_pointers = self._initialize_pointers(self.kvcaches)
 
         # Quantized retrieval path: transfer quantized tensors to GPU first,
         # then dequantize on GPU directly into vLLM paged KV cache.
+        # NOTE: Check this BEFORE accessing memory_obj.tensor since quantized
+        # objects use multi-tensor format (k_encoded, k_scale, k_mn, v_encoded,
+        # v_scale, v_mn) and don't have a single tensor property.
         if getattr(memory_obj.metadata, "is_quantized", False):
             if self.use_mla:
                 raise NotImplementedError(
@@ -354,6 +345,30 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
             ):
                 raise ValueError("Quantized MemoryObj missing one or more tensors")
 
+            # Prefetch quantized tensors to GPU to avoid UVA reads.
+            if self.device.type == "cuda":
+                tensors = [k_encoded, k_scale, k_mn, v_encoded, v_scale, v_mn]
+                shapes = [t.shape for t in tensors]
+                dtypes = [t.dtype for t in tensors]
+                if (
+                    self.quantized_gpu_buffers is None
+                    or self.quantized_gpu_buffer_shapes != shapes
+                    or self.quantized_gpu_buffer_dtypes != dtypes
+                ):
+                    self.quantized_gpu_buffers = [
+                        torch.empty(shape, dtype=dtype, device=self.device)
+                        for shape, dtype in zip(shapes, dtypes, strict=True)
+                    ]
+                    self.quantized_gpu_buffer_shapes = shapes
+                    self.quantized_gpu_buffer_dtypes = dtypes
+
+                with torch.cuda.stream(self.load_stream):
+                    for buf, src in zip(self.quantized_gpu_buffers, tensors, strict=True):
+                        buf.copy_(src, non_blocking=True)
+                    k_encoded, k_scale, k_mn, v_encoded, v_scale, v_mn = (
+                        self.quantized_gpu_buffers
+                    )
+
             # Quantized fast path: keep quantized tensors on CPU pinned (or CUDA)
             # and let the CUDA op read them via UVA, then dequantize directly into
             # vLLM paged KV cache.
@@ -373,6 +388,27 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
 
             return
 
+        # Non-quantized path
+        assert memory_obj.tensor is not None
+
+        if self.use_mla:
+            if memory_obj.metadata.fmt != MemoryFormat.KV_MLA_FMT:
+                raise ValueError(
+                    "The memory object should be in KV_MLA_FMT format in"
+                    " order to be processed by VLLMPagedMemGPUConnector"
+                )
+        else:
+            # Support both KV_2TD ([2, T, D]) and KV_2LTD ([T, 2, D]) formats
+            # vLLM uses KV_2LTD, but LMCache internally uses KV_2TD
+            # The multi_layer_kv_transfer op handles the format conversion
+            if memory_obj.metadata.fmt not in (MemoryFormat.KV_2TD,
+                                                MemoryFormat.KV_2LTD):
+                raise ValueError(
+                    f"The memory object should be in KV_2TD or KV_2LTD format "
+                    f"in order to be processed by VLLMPagedMemGPUConnector, "
+                    f"got {memory_obj.metadata.fmt}"
+                )
+
         lmc_ops.multi_layer_kv_transfer(
             memory_obj.tensor,
             kv_cache_pointers,
@@ -388,7 +424,7 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
         """Expect a kwarg 'kvcaches' which is a nested tuple of K and V tensors.
         The kvcaches should correspond to the "WHOLE token sequence".
 
-        Will set the memory_obj.metadata.fmt to MemoryFormat.KV_2LTD.
+        Will set the memory_obj.metadata.fmt to MemoryFormat.KV_2TD.
 
         Note:
           1. This function expects the 'slot_mapping' is a "full slot mapping"
@@ -450,6 +486,9 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
 
         if self.use_mla:
             memory_obj.metadata.fmt = MemoryFormat.KV_MLA_FMT
+        else:
+            # Set correct format for non-MLA: shape is [2, L, T, D] = KV_2TD
+            memory_obj.metadata.fmt = MemoryFormat.KV_2TD
 
     # TODO(Jiayi): need to optimize to enable real batching
     def batched_to_gpu(self, memory_objs, starts, ends, **kwargs):
@@ -1579,7 +1618,7 @@ class SGLangGPUConnector(GPUConnectorInterface):
         """Expect a kwarg 'kvcaches' which is a nested tuple of K and V tensors.
         The kvcaches should correspond to the "WHOLE token sequence".
 
-        Will set the memory_obj.metadata.fmt to MemoryFormat.KV_2LTD.
+        Will set the memory_obj.metadata.fmt to MemoryFormat.KV_2TD.
 
         Note:
           1. This function expects the 'slot_mapping' is a "partial slot mapping"
@@ -1639,6 +1678,9 @@ class SGLangGPUConnector(GPUConnectorInterface):
 
         if self.use_mla:
             memory_obj.metadata.fmt = MemoryFormat.KV_MLA_FMT
+        else:
+            # Set correct format for non-MLA: shape is [2, L, T, D] = KV_2TD
+            memory_obj.metadata.fmt = MemoryFormat.KV_2TD
 
     def get_shape(self, num_tokens: int) -> torch.Size:
         return torch.Size([2, self.num_layers, num_tokens, self.hidden_dim_size])
