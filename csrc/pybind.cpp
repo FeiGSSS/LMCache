@@ -23,53 +23,51 @@ PYBIND11_MODULE(c_ops, m) {
   //   (k_enc, k_scale, k_mn, v_enc, v_scale, v_mn), and the op will
   //   dequantize on GPU and write directly into vLLM paged KV cache.
   m.def(
-      "multi_layer_kv_transfer",
-                  [](py::object key_value,
-                         const torch::Tensor& key_value_ptrs,
-                         const torch::Tensor& slot_mapping,
-                         const torch::Device& paged_memory_device,
-                         const int page_buffer_size,
-                         const bool direction,
-                         const bool use_mla,
-                         const bool quantized,
-                         const int bits,
-                         const int group_size) {
-                        if (py::isinstance<py::sequence>(key_value)) {
-                              auto seq = key_value.cast<py::sequence>();
-                              TORCH_CHECK(quantized,
-                                                                  "TensorList requires quantized=true for dequantize path");
-                              TORCH_CHECK(seq.size() == 6,
-                                                                  "quantized=true expects a sequence of 6 tensors: "
-                                                                  "(k_encoded, k_scale, k_mn, v_encoded, v_scale, v_mn)");
+    "multi_layer_kv_transfer",
+    [](py::object key_value,
+       const torch::Tensor& key_value_ptrs,
+       const torch::Tensor& slot_mapping,
+       const torch::Device& paged_memory_device,
+       const int page_buffer_size,
+       const bool direction,
+       const bool use_mla,
+       const bool quantized,
+       const int bits,
+       const int group_size) {
+      if (py::isinstance<py::sequence>(key_value)) {
+        auto seq = key_value.cast<py::sequence>();
+        TORCH_CHECK(quantized, "TensorList requires quantized=true for dequantize path");
+        TORCH_CHECK(seq.size() == 6,
+                    "quantized=true expects a sequence of 6 tensors: "
+                    "(k_encoded, k_scale, k_mn, v_encoded, v_scale, v_mn)");
 
-                              std::vector<torch::Tensor> kv_list;
-                              kv_list.reserve(6);
-                              for (size_t i = 0; i < 6; ++i) {
-                                    kv_list.push_back(seq[i].cast<torch::Tensor>());
-                              }
+        std::vector<torch::Tensor> kv_list;
+        kv_list.reserve(6);
+        for (size_t i = 0; i < 6; ++i) {
+          kv_list.push_back(seq[i].cast<torch::Tensor>());
+        }
 
-                              return multi_layer_kv_transfer(kv_list, key_value_ptrs, slot_mapping,
-                                                                                                                         paged_memory_device, page_buffer_size,
-                                                                                                                         direction, use_mla, bits, group_size);
-                        }
+        return multi_layer_kv_transfer(kv_list, key_value_ptrs, slot_mapping,
+                                       paged_memory_device, page_buffer_size,
+                                       direction, use_mla, bits, group_size);
+      }
 
-                        TORCH_CHECK(!quantized,
-                                                "quantized=true expects a TensorList, got Tensor");
-                        auto kv = key_value.cast<torch::Tensor>();
-                        return multi_layer_kv_transfer(kv, key_value_ptrs, slot_mapping,
-                                                                                                                 paged_memory_device, page_buffer_size,
-                                                                                                                 direction, use_mla);
-                  },
-      py::arg("key_value"),
-      py::arg("key_value_ptrs"),
-      py::arg("slot_mapping"),
-      py::arg("paged_memory_device"),
-      py::arg("page_buffer_size"),
-      py::arg("direction"),
-      py::arg("use_mla"),
-      py::arg("quantized") = false,
-      py::arg("bits") = 4,
-      py::arg("group_size") = 128);
+      TORCH_CHECK(!quantized, "quantized=true expects a TensorList, got Tensor");
+      auto kv = key_value.cast<torch::Tensor>();
+      return multi_layer_kv_transfer(kv, key_value_ptrs, slot_mapping,
+                                     paged_memory_device, page_buffer_size,
+                                     direction, use_mla);
+    },
+    py::arg("key_value"),
+    py::arg("key_value_ptrs"),
+    py::arg("slot_mapping"),
+    py::arg("paged_memory_device"),
+    py::arg("page_buffer_size"),
+    py::arg("direction"),
+    py::arg("use_mla"),
+    py::arg("quantized") = false,
+    py::arg("bits") = 4,
+    py::arg("group_size") = 128);
   m.def("multi_layer_kv_transfer_unilateral",
         &multi_layer_kv_transfer_unilateral);
   m.def("single_layer_kv_transfer", &single_layer_kv_transfer);
