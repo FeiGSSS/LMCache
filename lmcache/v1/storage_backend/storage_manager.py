@@ -252,10 +252,28 @@ def _quantize_memory_objects(
                     shape,
                 )
         elif fmt == MemoryFormat.KV_2TD:
-            # Compressed binary format - not supported for quantization yet
-            logger.debug(
-                "KV_2TD format not yet supported for quantization; skipping"
-            )
+            # Shape: [2, L, T, D] or [2, T, D]
+            # First dim is 2 (K/V), rest is [..., T, D]
+            if shape[0] == 2:
+                if tensor.dim() == 4:
+                    # [2, L, T, D] - extract K and V for each layer
+                    # We'll treat L as extra head dimension
+                    k_cache = tensor[0]  # [L, T, D]
+                    v_cache = tensor[1]  # [L, T, D]
+                elif tensor.dim() == 3:
+                    # [2, T, D]
+                    k_cache = tensor[0]  # [T, D]
+                    v_cache = tensor[1]  # [T, D]
+                else:
+                    logger.warning(
+                        "KV_2TD format expects 3D/4D tensor, got dim=%s; skipping quantization",
+                        tensor.dim(),
+                    )
+            else:
+                logger.warning(
+                    "KV_2TD format expects shape[0] == 2, got %s; skipping quantization",
+                    shape,
+                )
         else:
             logger.debug(
                 "MemoryFormat %s not supported for KV quantization; skipping",
@@ -303,21 +321,22 @@ def _quantize_memory_objects(
         v_encoded, v_scale, v_mn = quantize_cache(v_cache, "v", group_size, bits)
 
         # Calculate shapes and dtypes for quantized tensors
+        # Keep scale/mn dtype consistent with quantize_cache output
         shapes = [
             k_encoded.shape,  # int32
-            k_scale.shape,    # float16
-            k_mn.shape,       # float16
+            k_scale.shape,    # scale dtype
+            k_mn.shape,       # mn dtype
             v_encoded.shape,  # int32
-            v_scale.shape,    # float16
-            v_mn.shape,       # float16
+            v_scale.shape,    # scale dtype
+            v_mn.shape,       # mn dtype
         ]
         dtypes = [
-            torch.int32,
-            torch.float16,
-            torch.float16,
-            torch.int32,
-            torch.float16,
-            torch.float16,
+            k_encoded.dtype,
+            k_scale.dtype,
+            k_mn.dtype,
+            v_encoded.dtype,
+            v_scale.dtype,
+            v_mn.dtype,
         ]
 
         # Allocate new memory for quantized data
