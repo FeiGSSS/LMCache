@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include <torch/all.h>
+#include <vector>
 #include <c10/cuda/CUDAGuard.h>
 #include "mem_kernels.cuh"
 #include <ATen/ATen.h>
@@ -479,6 +480,27 @@ void multi_layer_kv_transfer(torch::Tensor& key_value,
 #undef LAUNCH_MULTI_LAYER_KV_TRANSFER
 }
 
+void multi_layer_kv_transfer(const std::vector<torch::Tensor>& key_value_list,
+               const torch::Tensor& key_value_ptrs,
+               const torch::Tensor& slot_mapping,
+               const torch::Device& paged_memory_device,
+               const int page_buffer_size, const bool direction,
+               const bool use_mla, const int bits,
+               const int group_size) {
+  TORCH_CHECK(!direction,
+        "TensorList path supports only LMCache->vLLM (direction=false)");
+  TORCH_CHECK(!use_mla, "TensorList path does not support MLA format yet");
+  TORCH_CHECK(key_value_list.size() == 6,
+        "TensorList expects 6 tensors: "
+        "(k_encoded, k_scale, k_mn, v_encoded, v_scale, v_mn)");
+
+  return multi_layer_kv_transfer_dequantize(
+    key_value_list[0], key_value_list[1], key_value_list[2],
+    key_value_list[3], key_value_list[4], key_value_list[5],
+    key_value_ptrs, slot_mapping, paged_memory_device, page_buffer_size,
+    bits, group_size);
+}
+
 /**
  * Quickly offload KV cache from SGLang paged memory to the offloading buffer
  * Processes all the layers at the same time
@@ -712,21 +734,55 @@ void multi_layer_kv_transfer_dequantize(
   const at::cuda::OptionalCUDAGuard device_guard(paged_memory_device);
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
+  // Prefetch quantized tensors to GPU if they are on pinned CPU.
+  // Copies are enqueued on the current stream to preserve ordering.
+  torch::Tensor k_encoded_dev = k_encoded;
+  torch::Tensor v_encoded_dev = v_encoded;
+  torch::Tensor k_scale_dev = k_scale;
+  torch::Tensor k_mn_dev = k_mn;
+  torch::Tensor v_scale_dev = v_scale;
+  torch::Tensor v_mn_dev = v_mn;
+
+  if (!k_encoded.is_cuda()) {
+    k_encoded_dev = k_encoded.to(paged_memory_device, k_encoded.scalar_type(),
+                                 /*non_blocking=*/true, /*copy=*/true);
+  }
+  if (!v_encoded.is_cuda()) {
+    v_encoded_dev = v_encoded.to(paged_memory_device, v_encoded.scalar_type(),
+                                 /*non_blocking=*/true, /*copy=*/true);
+  }
+  if (!k_scale.is_cuda()) {
+    k_scale_dev = k_scale.to(paged_memory_device, k_scale.scalar_type(),
+                             /*non_blocking=*/true, /*copy=*/true);
+  }
+  if (!k_mn.is_cuda()) {
+    k_mn_dev = k_mn.to(paged_memory_device, k_mn.scalar_type(),
+                       /*non_blocking=*/true, /*copy=*/true);
+  }
+  if (!v_scale.is_cuda()) {
+    v_scale_dev = v_scale.to(paged_memory_device, v_scale.scalar_type(),
+                             /*non_blocking=*/true, /*copy=*/true);
+  }
+  if (!v_mn.is_cuda()) {
+    v_mn_dev = v_mn.to(paged_memory_device, v_mn.scalar_type(),
+                       /*non_blocking=*/true, /*copy=*/true);
+  }
+
   AT_DISPATCH_FLOATING_TYPES_AND2(
-      at::ScalarType::Half, at::ScalarType::BFloat16, k_scale.scalar_type(),
+      at::ScalarType::Half, at::ScalarType::BFloat16, k_scale_dev.scalar_type(),
       "multi_layer_kv_transfer_dequantize", [&] {
         const int32_t* k_encoded_ptr =
-            get_kernel_ptr<const int32_t, const torch::Tensor>(k_encoded);
+            get_kernel_ptr<const int32_t, const torch::Tensor>(k_encoded_dev);
         const int32_t* v_encoded_ptr =
-            get_kernel_ptr<const int32_t, const torch::Tensor>(v_encoded);
+            get_kernel_ptr<const int32_t, const torch::Tensor>(v_encoded_dev);
         const scalar_t* k_scale_ptr =
-            get_kernel_ptr<const scalar_t, const torch::Tensor>(k_scale);
+            get_kernel_ptr<const scalar_t, const torch::Tensor>(k_scale_dev);
         const scalar_t* k_mn_ptr =
-            get_kernel_ptr<const scalar_t, const torch::Tensor>(k_mn);
+            get_kernel_ptr<const scalar_t, const torch::Tensor>(k_mn_dev);
         const scalar_t* v_scale_ptr =
-            get_kernel_ptr<const scalar_t, const torch::Tensor>(v_scale);
+            get_kernel_ptr<const scalar_t, const torch::Tensor>(v_scale_dev);
         const scalar_t* v_mn_ptr =
-            get_kernel_ptr<const scalar_t, const torch::Tensor>(v_mn);
+            get_kernel_ptr<const scalar_t, const torch::Tensor>(v_mn_dev);
         scalar_t** page_buffer_ptrs =
             get_kernel_ptr<scalar_t*, const torch::Tensor>(key_value_ptrs);
 

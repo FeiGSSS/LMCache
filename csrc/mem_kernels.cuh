@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include <torch/all.h>
+#include <vector>
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/util/Exception.h>
@@ -19,6 +20,16 @@ void multi_layer_kv_transfer(torch::Tensor& key_value,
                              const torch::Device& paged_memory_device,
                              const int page_buffer_size, const bool direction,
                              const bool use_mla);
+
+// Overload: accept a list of tensors for quantized KV transfer.
+// Expects 6 tensors: (k_encoded, k_scale, k_mn, v_encoded, v_scale, v_mn).
+void multi_layer_kv_transfer(const std::vector<torch::Tensor>& key_value_list,
+                             const torch::Tensor& key_value_ptrs,
+                             const torch::Tensor& slot_mapping,
+                             const torch::Device& paged_memory_device,
+                             const int page_buffer_size, const bool direction,
+                             const bool use_mla, const int bits,
+                             const int group_size);
 
 void multi_layer_kv_transfer_unilateral(
     torch::Tensor& key_value, const torch::Tensor& key_value_ptrs,

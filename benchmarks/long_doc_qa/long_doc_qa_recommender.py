@@ -20,15 +20,39 @@ def determine_per_gpu_memory():
 
 
 def get_tensor_parallel_recommendation(model_name: str):
-    api = HfApi()
-    info = api.model_info(model_name)
-    total_bits = 0
-    for dtype, num_weights in info.safetensors.parameters.items():
-        m = re.search(r"\d+", dtype)
-        assert m is not None, "No bits information found from the HF API"
-        num_bits_in_dtype = int(m.group())
-        total_bits = num_bits_in_dtype * num_weights
-        break
+    # Check if model_name is a local path
+    import os
+    if os.path.isdir(model_name):
+        # Local model - estimate from model config
+        config_path = os.path.join(model_name, "config.json")
+        if os.path.exists(config_path):
+            import json
+            with open(config_path, 'r') as f:
+                config = json.load(f)
+            # Estimate parameter count from hidden_size and num_hidden_layers
+            hidden_size = config.get("hidden_size", 4096)
+            num_hidden_layers = config.get("num_hidden_layers", 32)
+            intermediate_size = config.get("intermediate_size", 14336)
+            vocab_size = config.get("vococab_size", 151936)
+            # Rough estimate: 2 * (hidden_size^2) * num_layers + vocab_size * hidden_size
+            # Using intermediate_size as approximation for FFN dimension
+            total_params = (2 * hidden_size * intermediate_size +
+                          hidden_size * vocab_size) * num_hidden_layers
+            total_bits = total_params * 16  # Assume bf16/fp16
+            total_bits = float(total_bits)
+            print(f"Estimated model parameters from local config")
+        else:
+            raise RuntimeError(f"Config file not found at {config_path}")
+    else:
+        api = HfApi()
+        info = api.model_info(model_name)
+        total_bits = 0
+        for dtype, num_weights in info.safetensors.parameters.items():
+            m = re.search(r"\d+", dtype)
+            assert m is not None, "No bits information found from the HF API"
+            num_bits_in_dtype = int(m.group())
+            total_bits = num_bits_in_dtype * num_weights
+            break
     if total_bits == 0:
         raise RuntimeError("No parameters found in the model")
 

@@ -1,0 +1,25 @@
+# LMCache KV Quantization Configuration
+# Copy this file and modify as needed for different experiments
+
+# KV Cache Quantization Settings
+enable_kv_quantization: true          # Enable KIVI-style quantization
+kv_quantization_bits: 8               # Quantization bits: 2, 4, or 8
+kv_quantization_group_size: 128       # Group size for quantization
+
+# Cache Settings
+chunk_size: 256                       # Chunk size for KV cache
+local_cpu: True                      # Disable CPU offloading
+max_local_cpu_size: 66                # Minimum CPU cache size
+save_unfull_chunk: False              # Only save complete chunks
+
+# Experiment Variations:
+#
+# For 2-bit quantization:
+#   kv_quantization_bits: 2
+#
+# For 8-bit quantization:
+#   kv_quantization_bits: 8
+#
+# For different group sizes:
+#   kv_quantization_group_size: 64   # Smaller groups, better accuracy
+#   kv_quantization_group_size: 256  # Larger groups, less overhead
