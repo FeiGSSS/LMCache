@@ -764,6 +764,106 @@ if self.quantize_executor is not None:
 
 ---
 
+## 2026-01-30: 修复 Retrieve 时崩溃问题
+
+### 问题描述
+运行时崩溃：
+```
+RuntimeError: shape '[36, 32, 1024]' is invalid for input of size 2506752
+```
+
+**错误位置**: `VLLMPagedMemGPUConnectorV2.to_gpu` 第297行
+```
+assert memory_obj.tensor is not None
+```
+
+### 根因分析
+1. `is_quantized` 检查在第327行，但在第297行就尝试访问 `memory_obj.tensor`
+2. 对于量化对象，`memory_obj.tensor` 属性尝试将 raw_data（包含6个张量）reshape 为原始形状
+3. 原始形状 `[36, 32, 1024]` 需要 1179648 元素，但 raw_data 有 2506752 元素（6个张量总大小）
+
+### 修复方案
+**文件**: `lmcache/v1/gpu_connector.py`
+
+将 `is_quantized` 检查移到最前面，在访问 `memory_obj.tensor` 之前：
+
+```python
+def to_gpu(self, memory_obj: MemoryObj, start: int, end: int, **kwargs):
+    self.initialize_kvcaches_ptr(**kwargs)
+    assert self.kvcaches is not None
+    ...
+    slot_mapping: torch.Tensor = kwargs["slot_mapping"]
+    kv_cache_pointers = self._initialize_pointers(self.kvcaches)
+
+    # Quantized retrieval path - CHECK BEFORE accessing memory_obj.tensor
+    if getattr(memory_obj.metadata, "is_quantized", False):
+        # 使用 get_tensor(0-5) 访问6个量化张量
+        # 直接调用 CUDA kernel 进行 GPU 端反量化
+        ...
+        return  # 提前返回，不访问 memory_obj.tensor
+
+    # Non-quantized path
+    assert memory_obj.tensor is not None
+    # 原有 format 检查和 transfer 逻辑
+    ...
+```
+
+### 修复效果
+- 量化检索路径直接使用 `get_tensor(i)` 访问6个张量
+- 非量化路径逻辑不变
+- 避免了对量化对象调用 `memory_obj.tensor` 属性
+
+---
+
+## 2026-01-30: 扩展 multi_layer_kv_transfer C++ 接口
+
+### 目标
+- 允许 `multi_layer_kv_transfer` 接受 **Tensor** 或 **TensorList**。
+- 为量化路径提供稳定的 C++ 入口，减少 Python 层分支逻辑。
+
+### 修改点
+- `csrc/mem_kernels.cuh`
+    - 增加 `multi_layer_kv_transfer(const std::vector<torch::Tensor>& ...)` 重载声明。
+- `csrc/mem_kernels.cu`
+    - 实现 TensorList 重载，要求 6 个量化张量，内部转发到 `multi_layer_kv_transfer_dequantize`。
+- `csrc/pybind.cpp`
+    - 通过 `py::object` 判别：Tensor 走原路径；TensorList 走新重载（`quantized=true`）。
+
+### 约束
+- TensorList 路径当前仅支持 `direction=false` 且 `use_mla=false`。
+
+---
+
+## 2026-01-30: 量化预取逻辑内聚到 C++ op
+
+### 变更
+- `multi_layer_kv_transfer_dequantize` 内部在发现量化张量位于 pinned CPU 时，
+    使用当前 CUDA stream 异步拷贝到 GPU 后再执行 kernel。
+- `gpu_connector.py` 中移除 Python 侧显式预取/缓存逻辑。
+
+### 预期效果
+- 降低 Python 层循环与多次拷贝开销，保持单一 op 调用。
+- 与原有 UVA 路径兼容（输入为 CUDA 张量时不额外拷贝）。
+
+---
+
+## 2026-01-30: 量化长文基准测试（vLLM + LMCache）
+
+### 结果
+- Warmup round mean TTFT: 1.785s
+- Warmup round time: 57.353s
+- Warmup round prompt count: 46
+- Warmup round successful prompt count: 46
+- Query round mean TTFT: 0.109s
+- Query round time: 18.821s
+- Query round prompt count: 46
+- Query round successful prompt count: 46
+
+### 备注
+- 量化路径已可稳定运行，结果较前一版进一步改善。
+
+---
+
 ## 注意事项
 1. **忽略预留接口**: `lmcache/v1/storage_backend/naive_serde/kivi_serde.py` 中的 `KIVISerializer` 是预留的 TODO，与本次实现无关
 2. **兼容性**: 量化关闭时，系统应与原行为完全一致

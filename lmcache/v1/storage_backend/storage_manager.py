@@ -575,6 +575,26 @@ class StorageManager:
         self.quantization_bits = config.kv_quantization_bits
         self.quantization_group_size = config.kv_quantization_group_size
 
+        # Safety isolation for unsupported models/settings.
+        # TODO: Add MLA quantization/dequantization support and revisit this gate.
+        if self.enable_quantization and getattr(metadata, "use_mla", False):
+            logger.warning(
+                "KV quantization is disabled for MLA models (not supported yet)."
+            )
+            self.enable_quantization = False
+
+        # TODO: Expand quantization support for additional KV dtypes if needed.
+        if self.enable_quantization and getattr(metadata, "kv_dtype", None) not in (
+            torch.float16,
+            torch.bfloat16,
+        ):
+            logger.warning(
+                "KV quantization is disabled for kv_dtype=%s (unsupported). "
+                "Falling back to non-quantized storage.",
+                getattr(metadata, "kv_dtype", None),
+            )
+            self.enable_quantization = False
+
         # Thread pool for CPU-bound quantization tasks (only if quantization enabled)
         # Using explicit thread pool for better control over worker count
         if self.enable_quantization:

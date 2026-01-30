@@ -202,10 +202,6 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
         self.kvcaches: Optional[List[torch.Tensor]] = None
 
         self.gpu_buffer: Optional[torch.Tensor] = None
-        # Optional staging buffers for quantized tensors on GPU
-        self.quantized_gpu_buffers: Optional[list[torch.Tensor]] = None
-        self.quantized_gpu_buffer_shapes: Optional[list[torch.Size]] = None
-        self.quantized_gpu_buffer_dtypes: Optional[list[torch.dtype]] = None
         self.use_mla = "use_mla" in kwargs and kwargs["use_mla"]
         if use_gpu:
             assert "chunk_size" in kwargs, (
@@ -317,6 +313,7 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
         # v_scale, v_mn) and don't have a single tensor property.
         if getattr(memory_obj.metadata, "is_quantized", False):
             if self.use_mla:
+                # TODO: Add MLA quantized retrieval support.
                 raise NotImplementedError(
                     "Quantized retrieval for MLA format is not supported yet."
                 )
@@ -344,30 +341,6 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
                 or v_mn is None
             ):
                 raise ValueError("Quantized MemoryObj missing one or more tensors")
-
-            # Prefetch quantized tensors to GPU to avoid UVA reads.
-            if self.device.type == "cuda":
-                tensors = [k_encoded, k_scale, k_mn, v_encoded, v_scale, v_mn]
-                shapes = [t.shape for t in tensors]
-                dtypes = [t.dtype for t in tensors]
-                if (
-                    self.quantized_gpu_buffers is None
-                    or self.quantized_gpu_buffer_shapes != shapes
-                    or self.quantized_gpu_buffer_dtypes != dtypes
-                ):
-                    self.quantized_gpu_buffers = [
-                        torch.empty(shape, dtype=dtype, device=self.device)
-                        for shape, dtype in zip(shapes, dtypes, strict=True)
-                    ]
-                    self.quantized_gpu_buffer_shapes = shapes
-                    self.quantized_gpu_buffer_dtypes = dtypes
-
-                with torch.cuda.stream(self.load_stream):
-                    for buf, src in zip(self.quantized_gpu_buffers, tensors, strict=True):
-                        buf.copy_(src, non_blocking=True)
-                    k_encoded, k_scale, k_mn, v_encoded, v_scale, v_mn = (
-                        self.quantized_gpu_buffers
-                    )
 
             # Quantized fast path: keep quantized tensors on CPU pinned (or CUDA)
             # and let the CUDA op read them via UVA, then dequantize directly into
