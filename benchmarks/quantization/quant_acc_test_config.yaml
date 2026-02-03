@@ -1,0 +1,9 @@
+# KV Cache Quantization Settings
+enable_kv_quantization: true          # Enable KIVI-style quantization
+kv_quantization_bits: 4               # Quantization bits: 2, 4, or 8
+kv_quantization_group_size: 128       # Group size for quantization
+
+# Cache Settings
+chunk_size: 256                       # Chunk size for KV cache
+local_cpu: True                      # Disable CPU offloading
+max_local_cpu_size: 300                # Minimum CPU cache size
