@@ -1,0 +1,11 @@
+# LMCache Configuration for TTFT Test (No Quantization)
+# Baseline configuration for comparison
+
+# KV Cache Quantization Settings
+enable_kv_quantization: false         # Disable quantization
+
+# Cache Settings
+chunk_size: 256                       # Chunk size for KV cache
+local_cpu: True                       # Enable CPU offloading
+max_local_cpu_size: 150               # CPU cache size (handles ~100GB+ KV cache)
+save_unfull_chunk: False              # Only save complete chunks
