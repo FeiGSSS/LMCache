@@ -21,10 +21,10 @@ from transformers import AutoTokenizer
 import torch
 
 # First Party
-from lmcache.config import LMCacheEngineMetadata
 from lmcache.logging import init_logger
 from lmcache.utils import CacheEngineKey, _lmcache_nvtx_annotate
 from lmcache.v1.config import LMCacheEngineConfig
+from lmcache.v1.metadata import LMCacheMetadata
 
 logger = init_logger(__name__)
 
@@ -50,7 +50,7 @@ class TokenDatabase(metaclass=abc.ABCMeta):
     def __init__(
         self,
         config: Optional[LMCacheEngineConfig] = None,
-        metadata: Optional[LMCacheEngineMetadata] = None,
+        metadata: Optional[LMCacheMetadata] = None,
     ):
         global NONE_HASH
 
@@ -212,7 +212,6 @@ class TokenDatabase(metaclass=abc.ABCMeta):
         # collapse the CacheEngineKey.world_size to 1 so that cache keys
         # become world-size agnostic across compatible deployments.
         return CacheEngineKey(
-            self.metadata.fmt,
             self.metadata.model_name,
             self.metadata.world_size if not self.save_only_first_rank else 1,
             self.metadata.worker_id,
@@ -244,13 +243,13 @@ class ChunkedTokenDatabase(TokenDatabase):
     def __init__(
         self,
         config: Optional[LMCacheEngineConfig] = None,
-        metadata: Optional[LMCacheEngineMetadata] = None,
+        metadata: Optional[LMCacheMetadata] = None,
     ):
         super(ChunkedTokenDatabase, self).__init__(config, metadata)
 
         if config is not None:
+            self.config = config
             self.chunk_size = config.chunk_size
-            self.save_unfull_chunk = config.save_unfull_chunk
 
             # Check for cross-process cache sharing setup
             if os.getenv("PYTHONHASHSEED") is None:
@@ -270,8 +269,8 @@ class ChunkedTokenDatabase(TokenDatabase):
                         "This will cause incorrect KV cache transfer."
                     )
         else:  # Default values
+            self.config = None
             self.chunk_size = 256
-            self.save_unfull_chunk = True
 
     def _get_init_hash(self) -> int:
         return NONE_HASH
@@ -289,9 +288,12 @@ class ChunkedTokenDatabase(TokenDatabase):
         :return: a generator of chunks of tokens, each with
                 shape [chunk_size]
         """
+        save_unfull_chunk = (
+            self.config.save_unfull_chunk if self.config is not None else True
+        )
         end = (
             len(tokens)
-            if self.save_unfull_chunk
+            if save_unfull_chunk
             else (len(tokens) - len(tokens) % self.chunk_size)
         )
         for i in range(0, end, self.chunk_size):
@@ -397,7 +399,7 @@ class SegmentTokenDatabase(TokenDatabase):
     In the future, we might need to implement a fast substring match.
     """
 
-    def __init__(self, config: LMCacheEngineConfig, metadata: LMCacheEngineMetadata):
+    def __init__(self, config: LMCacheEngineConfig, metadata: LMCacheMetadata):
         super(SegmentTokenDatabase, self).__init__(config, metadata)
 
         self.tokenizer = AutoTokenizer.from_pretrained(metadata.model_name)
