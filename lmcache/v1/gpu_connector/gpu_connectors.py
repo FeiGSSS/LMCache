@@ -313,8 +313,9 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
                     slot_mapping[start:end],
                     self.device,
                     self.page_buffer_size,
-                    False,  # direction: False means LMCache->vLLM (H2D)
-                    self.use_mla,
+                    lmc_ops.TransferDirection.H2D,
+                    self.gpu_kv_format,
+                    self.block_size,
                     int(bits),
                     int(group_size),
                 )

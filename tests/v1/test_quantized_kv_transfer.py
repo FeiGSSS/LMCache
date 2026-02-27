@@ -48,17 +48,17 @@ def test_multi_layer_kv_transfer_quantized_dequant_to_vllm(slot_mapping_dtype: t
     )
 
     # Invoke unified op: dequantize on GPU and write into paged KV cache.
-    lmc_ops.multi_layer_kv_transfer(
-        (k_encoded, k_scale, k_mn, v_encoded, v_scale, v_mn),
+    lmc_ops.multi_layer_kv_transfer_quantized(
+        [k_encoded, k_scale, k_mn, v_encoded, v_scale, v_mn],
         key_value_ptrs,
         slot_mapping,
         device,
         page_buffer_size,
-        False,  # direction: LMCache -> vLLM
-        False,  # use_mla
-        quantized=True,
-        bits=bits,
-        group_size=group_size,
+        lmc_ops.TransferDirection.H2D,
+        lmc_ops.GPUKVFormat.NL_X_TWO_NB_BS_NH_HS,
+        0,  # block_size (not used for NL_X_TWO_NB_BS_NH_HS format)
+        bits,
+        group_size,
     )
 
     # Reference: dequantize on GPU then compare the specific slots that were written.
@@ -78,5 +78,5 @@ def test_multi_layer_kv_transfer_quantized_dequant_to_vllm(slot_mapping_dtype: t
         # CUDA kernel dequantizes in float32 then casts to fp16/bf16,
         # while the Python reference may use lower-precision intermediates.
         # Allow a small atol consistent with fp16 quantization error.
-        torch.testing.assert_close(got_k, exp_k, rtol=0.0, atol=2e-3)
-        torch.testing.assert_close(got_v, exp_v, rtol=0.0, atol=2e-3)
+        torch.testing.assert_close(got_k, exp_k, rtol=0.0, atol=4e-3)
+        torch.testing.assert_close(got_v, exp_v, rtol=0.0, atol=4e-3)

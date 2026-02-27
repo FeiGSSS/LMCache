@@ -40,8 +40,9 @@ PYBIND11_MODULE(c_ops, m) {
        const torch::Tensor& slot_mapping,
        const torch::Device& paged_memory_device,
        const int page_buffer_size,
-       const bool direction,
-       const bool use_mla,
+       const TransferDirection direction,
+       const GPUKVFormat gpu_kv_format,
+       const int block_size,
        const int bits,
        const int group_size) {
       TORCH_CHECK(key_value_list.size() == 6,
@@ -49,7 +50,8 @@ PYBIND11_MODULE(c_ops, m) {
                   "(k_encoded, k_scale, k_mn, v_encoded, v_scale, v_mn)");
       return multi_layer_kv_transfer(key_value_list, key_value_ptrs, slot_mapping,
                                      paged_memory_device, page_buffer_size,
-                                     direction, use_mla, bits, group_size);
+                                     direction, gpu_kv_format, block_size,
+                                     bits, group_size);
     },
     py::arg("key_value_list"),
     py::arg("key_value_ptrs"),
@@ -57,7 +59,8 @@ PYBIND11_MODULE(c_ops, m) {
     py::arg("paged_memory_device"),
     py::arg("page_buffer_size"),
     py::arg("direction"),
-    py::arg("use_mla"),
+    py::arg("gpu_kv_format"),
+    py::arg("block_size") = 0,
     py::arg("bits") = 4,
     py::arg("group_size") = 128);
 

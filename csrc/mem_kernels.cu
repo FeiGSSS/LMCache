@@ -981,7 +981,7 @@ __device__ __forceinline__ int unpack_int32_lowbit(const int32_t code,
   return (code >> (idx_in_pack * bits)) & mask;
 }
 
-template <typename scalar_t, typename index_t>
+template <typename scalar_t, typename index_t, GPUKVFormat format>
 __global__ void dequantize_and_store_multi_layer_kernel_indexed(
     const int32_t* __restrict__ k_encoded,  // [L, T_packed, D]
     const scalar_t* __restrict__ k_scale,   // [L, T/group, 1, D]
@@ -993,8 +993,8 @@ __global__ void dequantize_and_store_multi_layer_kernel_indexed(
                                                 // PAGE_BUFFER_SIZE, D]
     const index_t* __restrict__ slot_mapping,   // [num_tokens]
     const int T_packed, const int D, const int num_tokens,
-    const int num_layers, const int page_buffer_size, const int bits,
-    const int group_size) {
+    const int num_layers, const int page_buffer_size, const int block_size,
+    const int bits, const int group_size) {
   const int token_id = blockIdx.x;
   const int layer_id = blockIdx.y;
   const int k_or_v = blockIdx.z;
@@ -1039,8 +1039,8 @@ __global__ void dequantize_and_store_multi_layer_kernel_indexed(
 
     const float x = static_cast<float>(q) * scale_f + mn_f;
     const int64_t vllm_offset =
-        page_buffer_offset_legacy(k_or_v, static_cast<int>(slot_idx), d, D,
-                           page_buffer_size);
+        page_buffer_offset<format>(k_or_v, static_cast<int>(slot_idx), d, D,
+                           page_buffer_size, block_size);
     paged_buffer_ptr[vllm_offset] = static_cast<scalar_t>(x);
   }
 }
@@ -1053,7 +1053,8 @@ void multi_layer_kv_transfer_dequantize(
     const torch::Tensor& v_scale, const torch::Tensor& v_mn,
     const torch::Tensor& key_value_ptrs, const torch::Tensor& slot_mapping,
     const torch::Device& paged_memory_device, const int page_buffer_size,
-    const int bits, const int group_size) {
+    const TransferDirection direction, const GPUKVFormat gpu_kv_format,
+    const int block_size, const int bits, const int group_size) {
   // Allow encoded/scale/mn tensors to live on CUDA or pinned CPU.
   // This matches the existing multi_layer_kv_transfer behavior: kernels can
   // read from pinned host memory via UVA, avoiding an explicit staging copy.
@@ -1099,6 +1100,10 @@ void multi_layer_kv_transfer_dequantize(
                   slot_mapping.scalar_type() == at::kInt,
               "slot_mapping must be int64 (torch.long) or int32 (torch.int32)");
 
+  // Only H2D (LMCache -> vLLM) is supported for quantized path
+  TORCH_CHECK(direction == TransferDirection::H2D,
+              "Quantized dequantize path only supports H2D direction");
+
   const int num_layers = static_cast<int>(k_encoded.size(0));
   const int T_packed = static_cast<int>(k_encoded.size(1));
   const int D = static_cast<int>(k_encoded.size(2));
@@ -1125,6 +1130,9 @@ void multi_layer_kv_transfer_dequantize(
                   v_scale.size(2) == expected_v_groups && v_scale.size(3) == 1,
               "v_scale must be [L, T, D/group, 1]");
   TORCH_CHECK(v_mn.sizes() == v_scale.sizes(), "v_mn must match v_scale");
+
+  // Determine k_or_v_size based on format (MLA uses 1, others use 2)
+  const int k_or_v_size = lmc::is_mla(gpu_kv_format) ? 1 : 2;
 
   const at::cuda::OptionalCUDAGuard device_guard(paged_memory_device);
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
@@ -1163,6 +1171,33 @@ void multi_layer_kv_transfer_dequantize(
                        /*non_blocking=*/true, /*copy=*/true);
   }
 
+  // Macro to launch kernel with format template parameter
+#define LAUNCH_DEQUANT_KERNEL_WITH_FORMAT(FORMAT)                              \
+  do {                                                                         \
+    if (slot_mapping.scalar_type() == at::kLong) {                             \
+      const int64_t* slot_mapping_ptr =                                        \
+          get_kernel_ptr<const int64_t, const torch::Tensor>(slot_mapping);    \
+      lmc::dequantize_and_store_multi_layer_kernel_indexed<scalar_t, int64_t,  \
+                                                           FORMAT>             \
+          <<<grid, block, 0, stream>>>(                                        \
+              k_encoded_ptr, k_scale_ptr, k_mn_ptr, v_encoded_ptr,             \
+              v_scale_ptr, v_mn_ptr, page_buffer_ptrs, slot_mapping_ptr,       \
+              T_packed, D, num_tokens, num_layers, page_buffer_size,           \
+              block_size, bits, group_size);                                   \
+    } else {                                                                   \
+      const int32_t* slot_mapping_ptr =                                        \
+          get_kernel_ptr<const int32_t, const torch::Tensor>(slot_mapping);    \
+      lmc::dequantize_and_store_multi_layer_kernel_indexed<scalar_t, int32_t,  \
+                                                           FORMAT>             \
+          <<<grid, block, 0, stream>>>(                                        \
+              k_encoded_ptr, k_scale_ptr, k_mn_ptr, v_encoded_ptr,             \
+              v_scale_ptr, v_mn_ptr, page_buffer_ptrs, slot_mapping_ptr,       \
+              T_packed, D, num_tokens, num_layers, page_buffer_size,           \
+              block_size, bits, group_size);                                   \
+    }                                                                          \
+    C10_CUDA_KERNEL_LAUNCH_CHECK();                                            \
+  } while (0)
+
   AT_DISPATCH_FLOATING_TYPES_AND2(
       at::ScalarType::Half, at::ScalarType::BFloat16, k_scale_dev.scalar_type(),
       "multi_layer_kv_transfer_dequantize", [&] {
@@ -1181,30 +1216,32 @@ void multi_layer_kv_transfer_dequantize(
         scalar_t** page_buffer_ptrs =
             get_kernel_ptr<scalar_t*, const torch::Tensor>(key_value_ptrs);
 
-        dim3 grid(num_tokens, num_layers, 2);
+        dim3 grid(num_tokens, num_layers, k_or_v_size);
         dim3 block(256);
 
-        if (slot_mapping.scalar_type() == at::kLong) {
-          const int64_t* slot_mapping_ptr =
-            get_kernel_ptr<const int64_t, const torch::Tensor>(slot_mapping);
-          lmc::dequantize_and_store_multi_layer_kernel_indexed<scalar_t, int64_t>
-            <<<grid, block, 0, stream>>>(
-              k_encoded_ptr, k_scale_ptr, k_mn_ptr, v_encoded_ptr,
-              v_scale_ptr, v_mn_ptr, page_buffer_ptrs, slot_mapping_ptr,
-              T_packed, D, num_tokens, num_layers, page_buffer_size, bits,
-              group_size);
-        } else {
-          const int32_t* slot_mapping_ptr =
-            get_kernel_ptr<const int32_t, const torch::Tensor>(slot_mapping);
-          lmc::dequantize_and_store_multi_layer_kernel_indexed<scalar_t, int32_t>
-            <<<grid, block, 0, stream>>>(
-              k_encoded_ptr, k_scale_ptr, k_mn_ptr, v_encoded_ptr,
-              v_scale_ptr, v_mn_ptr, page_buffer_ptrs, slot_mapping_ptr,
-              T_packed, D, num_tokens, num_layers, page_buffer_size, bits,
-              group_size);
+        // Dispatch based on GPUKVFormat
+        switch (gpu_kv_format) {
+          case GPUKVFormat::NB_NL_TWO_BS_NH_HS:
+            LAUNCH_DEQUANT_KERNEL_WITH_FORMAT(GPUKVFormat::NB_NL_TWO_BS_NH_HS);
+            break;
+          case GPUKVFormat::NL_X_TWO_NB_BS_NH_HS:
+            LAUNCH_DEQUANT_KERNEL_WITH_FORMAT(GPUKVFormat::NL_X_TWO_NB_BS_NH_HS);
+            break;
+          case GPUKVFormat::NL_X_NB_TWO_BS_NH_HS:
+            LAUNCH_DEQUANT_KERNEL_WITH_FORMAT(GPUKVFormat::NL_X_NB_TWO_BS_NH_HS);
+            break;
+          case GPUKVFormat::NL_X_NB_BS_HS:
+            LAUNCH_DEQUANT_KERNEL_WITH_FORMAT(GPUKVFormat::NL_X_NB_BS_HS);
+            break;
+          case GPUKVFormat::NL_X_NBBS_ONE_HS:
+            LAUNCH_DEQUANT_KERNEL_WITH_FORMAT(GPUKVFormat::NL_X_NBBS_ONE_HS);
+            break;
+          default:
+            throw std::runtime_error("Unsupported GPUKVFormat for dequantization");
         }
-        C10_CUDA_KERNEL_LAUNCH_CHECK();
       });
+
+#undef LAUNCH_DEQUANT_KERNEL_WITH_FORMAT
 }
 
 // Overload: accept a list of tensors for quantized KV transfer.
@@ -1214,12 +1251,14 @@ void multi_layer_kv_transfer(const std::vector<torch::Tensor>& key_value_list,
                const torch::Tensor& key_value_ptrs,
                const torch::Tensor& slot_mapping,
                const torch::Device& paged_memory_device,
-               const int page_buffer_size, const bool direction,
-               const bool use_mla, const int bits,
+               const int page_buffer_size,
+               const TransferDirection direction,
+               const GPUKVFormat gpu_kv_format,
+               const int block_size,
+               const int bits,
                const int group_size) {
-  TORCH_CHECK(!direction,
-        "TensorList path supports only LMCache->vLLM (direction=false)");
-  TORCH_CHECK(!use_mla, "TensorList path does not support MLA format yet");
+  TORCH_CHECK(direction == TransferDirection::H2D,
+        "TensorList path supports only LMCache->vLLM (H2D direction)");
   TORCH_CHECK(key_value_list.size() == 6,
         "TensorList expects 6 tensors: "
         "(k_encoded, k_scale, k_mn, v_encoded, v_scale, v_mn)");
@@ -1228,5 +1267,5 @@ void multi_layer_kv_transfer(const std::vector<torch::Tensor>& key_value_list,
     key_value_list[0], key_value_list[1], key_value_list[2],
     key_value_list[3], key_value_list[4], key_value_list[5],
     key_value_ptrs, slot_mapping, paged_memory_device, page_buffer_size,
-    bits, group_size);
+    direction, gpu_kv_format, block_size, bits, group_size);
 }
