@@ -27,15 +27,12 @@ PYBIND11_MODULE(c_ops, m) {
       .value("NL_X_NBBS_ONE_HS", GPUKVFormat::NL_X_NBBS_ONE_HS)
       .export_values();
 
-  // Standard multi_layer_kv_transfer with new API (TransferDirection, GPUKVFormat)
-  m.def("multi_layer_kv_transfer", py::overload_cast<torch::Tensor&, const torch::Tensor&, const torch::Tensor&, const torch::Device&, const int, const TransferDirection, const GPUKVFormat, const int>(&multi_layer_kv_transfer));
-
-  // Quantized KV transfer: accepts a sequence of 6 tensors for GPU-side dequantization.
-  // This is used during retrieval when KV cache was quantized during store.
-  // Expects: (k_encoded, k_scale, k_mn, v_encoded, v_scale, v_mn)
+  // Unified multi_layer_kv_transfer API
+  // - key_value is Tensor: non-quantized path
+  // - key_value is list of 6 tensors: quantized path (dequantize on GPU)
   m.def(
-    "multi_layer_kv_transfer_quantized",
-    [](const std::vector<torch::Tensor>& key_value_list,
+    "multi_layer_kv_transfer",
+    [](py::object key_value,
        const torch::Tensor& key_value_ptrs,
        const torch::Tensor& slot_mapping,
        const torch::Device& paged_memory_device,
@@ -45,15 +42,25 @@ PYBIND11_MODULE(c_ops, m) {
        const int block_size,
        const int bits,
        const int group_size) {
-      TORCH_CHECK(key_value_list.size() == 6,
-                  "multi_layer_kv_transfer_quantized expects 6 tensors: "
-                  "(k_encoded, k_scale, k_mn, v_encoded, v_scale, v_mn)");
-      return multi_layer_kv_transfer(key_value_list, key_value_ptrs, slot_mapping,
-                                     paged_memory_device, page_buffer_size,
-                                     direction, gpu_kv_format, block_size,
-                                     bits, group_size);
+      if (py::isinstance<py::list>(key_value) || py::isinstance<py::tuple>(key_value)) {
+        // Quantized path: expect 6 tensors
+        auto kv_list = key_value.cast<std::vector<torch::Tensor>>();
+        TORCH_CHECK(kv_list.size() == 6,
+                    "Quantized path expects 6 tensors: "
+                    "(k_encoded, k_scale, k_mn, v_encoded, v_scale, v_mn)");
+        return multi_layer_kv_transfer(kv_list, key_value_ptrs, slot_mapping,
+                                       paged_memory_device, page_buffer_size,
+                                       direction, gpu_kv_format, block_size,
+                                       bits, group_size);
+      } else {
+        // Non-quantized path: expect single Tensor
+        auto kv = key_value.cast<torch::Tensor>();
+        return multi_layer_kv_transfer(kv, key_value_ptrs, slot_mapping,
+                                       paged_memory_device, page_buffer_size,
+                                       direction, gpu_kv_format, block_size);
+      }
     },
-    py::arg("key_value_list"),
+    py::arg("key_value"),
     py::arg("key_value_ptrs"),
     py::arg("slot_mapping"),
     py::arg("paged_memory_device"),

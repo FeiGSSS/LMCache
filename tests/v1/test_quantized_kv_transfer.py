@@ -48,7 +48,7 @@ def test_multi_layer_kv_transfer_quantized_dequant_to_vllm(slot_mapping_dtype: t
     )
 
     # Invoke unified op: dequantize on GPU and write into paged KV cache.
-    lmc_ops.multi_layer_kv_transfer_quantized(
+    lmc_ops.multi_layer_kv_transfer(
         [k_encoded, k_scale, k_mn, v_encoded, v_scale, v_mn],
         key_value_ptrs,
         slot_mapping,

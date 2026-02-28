@@ -307,7 +307,7 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
             # and let the CUDA op read them via UVA, then dequantize directly into
             # vLLM paged KV cache.
             with torch.cuda.stream(self.load_stream):
-                lmc_ops.multi_layer_kv_transfer_quantized(
+                lmc_ops.multi_layer_kv_transfer(
                     [k_encoded, k_scale, k_mn, v_encoded, v_scale, v_mn],
                     kv_cache_pointers,
                     slot_mapping[start:end],
