@@ -43,6 +43,8 @@ vllm serve /home/fei/research/models/Qwen3-8B \
   --scenario-file benchmarks/sharegpt_workload/scenarios_multiturn_ttft.yaml \
   --scenario-name target_10_inflight_600s \
   --seed 41 \
+  --progress-interval-sec 5 \
+  --progress-summary-json outputs/sharegpt_baseline_target_seed41_progress_live.json \
   --output-csv outputs/sharegpt_baseline_target_seed41.csv \
   --summary-json outputs/sharegpt_baseline_target_seed41.json
 ```
@@ -52,6 +54,12 @@ vllm serve /home/fei/research/models/Qwen3-8B \
 
 ```bash
 bash benchmarks/sharegpt_workload/run_dev_baseline_sharegpt.sh
+```
+
+实时进度查看：
+
+```bash
+tail -f outputs/sharegpt_dev_baseline_*/target_10_inflight_600s_seed41_progress_live.json
 ```
 
 ## 场景矩阵（Phase-1）

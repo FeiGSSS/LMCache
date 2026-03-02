@@ -252,6 +252,12 @@ def summarize_records(records: list[RequestRecord], benchmark_time_sec: float) -
     }
 
 
+def fmt_metric(value: Optional[float]) -> str:
+    if value is None:
+        return "na"
+    return f"{value:.3f}"
+
+
 def dump_records_csv(path: str, records: list[RequestRecord]) -> None:
     if not records:
         fields = [f.name for f in RequestRecord.__dataclass_fields__.values()]
@@ -377,6 +383,18 @@ def create_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--summary-json", type=str, default="multiturn_ttft_summary.json"
     )
+    parser.add_argument(
+        "--progress-interval-sec",
+        type=float,
+        default=10.0,
+        help="Live progress print interval in seconds; <=0 disables.",
+    )
+    parser.add_argument(
+        "--progress-summary-json",
+        type=str,
+        default=None,
+        help="Optional path to periodically dump live summary snapshots.",
+    )
     return parser
 
 
@@ -391,6 +409,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--duration-sec must be > 0")
     if args.request_timeout_sec <= 0:
         raise ValueError("--request-timeout-sec must be > 0")
+    if args.progress_interval_sec < 0:
+        raise ValueError("--progress-interval-sec must be >= 0")
     if args.max_context_tokens <= 0:
         raise ValueError("--max-context-tokens must be > 0")
     if args.think_base_sec < 0:
@@ -447,6 +467,15 @@ async def run_benchmark(args: argparse.Namespace) -> tuple[list[RequestRecord], 
 
     start_perf = time.perf_counter()
     end_time_limit = args.duration_sec
+    progress_interval = (
+        args.progress_interval_sec if args.progress_interval_sec > 0 else None
+    )
+    next_progress_time = progress_interval
+    progress_json_path = (
+        Path(args.progress_summary_json) if args.progress_summary_json else None
+    )
+    if progress_json_path is not None:
+        progress_json_path.parent.mkdir(parents=True, exist_ok=True)
 
     event_heap: list[tuple[float, int, int, DispatchEvent]] = []
     event_seq = 0
@@ -479,6 +508,68 @@ async def run_benchmark(args: argparse.Namespace) -> tuple[list[RequestRecord], 
         sessions_by_id[s.session_id] = s
         next_session_id += 1
         return s
+
+    def progress_snapshot(elapsed_sec: float, phase: str) -> dict[str, Any]:
+        total = len(request_records)
+        success = [r for r in request_records if r.status == "success"]
+        errors = total - len(success)
+        ttft_server = [r.ttft_server_sec for r in success if r.ttft_server_sec is not None]
+        queue_wait = [
+            r.client_queue_wait_sec
+            for r in request_records
+            if r.client_queue_wait_sec is not None
+        ]
+
+        sessions_started = next_session_id
+        sessions_finished = sum(1 for s in sessions_by_id.values() if s.finished)
+
+        return {
+            "phase": phase,
+            "elapsed_sec": elapsed_sec,
+            "duration_sec": end_time_limit,
+            "records_total": total,
+            "records_success": len(success),
+            "records_error": errors,
+            "success_rate": (len(success) / total) if total else 0.0,
+            "throughput_rps": total / max(elapsed_sec, 1e-9),
+            "inflight_current": inflight_current,
+            "inflight_peak": inflight_peak,
+            "max_inflight_limit": args.max_inflight_requests,
+            "pending_tasks": len(pending_tasks),
+            "pending_events": len(event_heap),
+            "sessions_started": sessions_started,
+            "sessions_finished": sessions_finished,
+            "sessions_total_limit": args.num_users,
+            "ttft_server_p50": percentile(ttft_server, 0.5),
+            "ttft_server_p95": percentile(ttft_server, 0.95),
+            "client_queue_wait_p50": percentile(queue_wait, 0.5),
+            "client_queue_wait_p95": percentile(queue_wait, 0.95),
+        }
+
+    def emit_progress(elapsed_sec: float, phase: str) -> None:
+        snap = progress_snapshot(elapsed_sec, phase)
+        print(
+            "[Progress]",
+            f"t={snap['elapsed_sec']:.1f}/{snap['duration_sec']:.1f}s",
+            f"phase={snap['phase']}",
+            f"records={snap['records_total']}",
+            f"succ={snap['records_success']}",
+            f"err={snap['records_error']}",
+            f"succ_rate={snap['success_rate']:.3f}",
+            f"inflight={snap['inflight_current']}/{snap['max_inflight_limit']}",
+            f"peak={snap['inflight_peak']}",
+            f"pending_tasks={snap['pending_tasks']}",
+            f"pending_events={snap['pending_events']}",
+            f"sessions={snap['sessions_finished']}/{snap['sessions_started']}/{snap['sessions_total_limit']}",
+            f"rps={snap['throughput_rps']:.2f}",
+            f"ttft_p50={fmt_metric(snap['ttft_server_p50'])}",
+            f"ttft_p95={fmt_metric(snap['ttft_server_p95'])}",
+            f"qwait_p50={fmt_metric(snap['client_queue_wait_p50'])}",
+            f"qwait_p95={fmt_metric(snap['client_queue_wait_p95'])}",
+        )
+        if progress_json_path is not None:
+            with open(progress_json_path, "w", encoding="utf-8") as f:
+                json.dump(snap, f, ensure_ascii=False, indent=2)
 
     async def execute_turn(session: ConversationSession, ready_time: float) -> None:
         nonlocal inflight_current, inflight_peak
@@ -636,6 +727,12 @@ async def run_benchmark(args: argparse.Namespace) -> tuple[list[RequestRecord], 
         if no_more_events and not pending_tasks:
             break
 
+        if progress_interval is not None and next_progress_time is not None:
+            while now >= next_progress_time:
+                phase = "run" if now <= end_time_limit else "drain"
+                emit_progress(now, phase)
+                next_progress_time += progress_interval
+
         if event_heap:
             next_due = event_heap[0][0]
             sleep_for = max(0.0, min(0.05, next_due - now))
@@ -644,12 +741,15 @@ async def run_benchmark(args: argparse.Namespace) -> tuple[list[RequestRecord], 
         await asyncio.sleep(sleep_for)
 
     benchmark_time = now_rel()
+    emit_progress(benchmark_time, "done")
     summary = summarize_records(request_records, benchmark_time)
     summary["run_id"] = run_id
     summary["scenario"] = scenario
     summary["seed"] = args.seed
     summary["benchmark_time_sec"] = benchmark_time
     summary["max_inflight_observed"] = inflight_peak
+    if progress_json_path is not None:
+        summary["progress_summary_json"] = str(progress_json_path)
     return request_records, summary
 
 

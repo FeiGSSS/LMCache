@@ -61,6 +61,8 @@ Phase-1 设计约束：
 2. `--summary-json`
 3. `--scenario-file`
 4. `--scenario-name`
+5. `--progress-interval-sec`（实时进度打印间隔，秒）
+6. `--progress-summary-json`（实时快照 JSON，可被 `tail` 监控）
 
 参数优先级：
 1. 同时提供 `--scenario-file` 与 CLI 参数时，CLI 显式传入值优先。
@@ -92,8 +94,16 @@ uv pip install openai pyyaml
   --model /home/fei/research/models/Qwen3-8B \
   --scenario-file benchmarks/sharegpt_workload/scenarios_multiturn_ttft.yaml \
   --scenario-name target_10_inflight_600s \
+  --progress-interval-sec 5 \
+  --progress-summary-json outputs/target_progress_live.json \
   --output-csv outputs/target_requests.csv \
   --summary-json outputs/target_summary.json
+```
+
+实时监控示例：
+
+```bash
+tail -f outputs/target_progress_live.json
 ```
 
 ### 3) 重复性测试（seed 扫描）

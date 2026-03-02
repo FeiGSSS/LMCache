@@ -10,6 +10,7 @@ SHAREGPT_PATH=${SHAREGPT_PATH:-/home/fei/research/datasets/ShareGPT_V3_unfiltere
 BASE_URL=${BASE_URL:-http://127.0.0.1:8000/v1}
 API_KEY=${API_KEY:-EMPTY}
 REQUEST_TIMEOUT_SEC=${REQUEST_TIMEOUT_SEC:-120}
+PROGRESS_INTERVAL_SEC=${PROGRESS_INTERVAL_SEC:-10}
 
 SEEDS=${SEEDS:-"41 42 43"}
 SCENARIOS=${SCENARIOS:-"functional_serial target_10_inflight_600s scan_arrival_low scan_arrival_mid scan_arrival_high scan_inflight_3 scan_inflight_5 scan_inflight_10 scan_inflight_20"}
@@ -55,6 +56,7 @@ mkdir -p "$OUTPUT_ROOT"
   echo "model_path=$MODEL_PATH"
   echo "sharegpt_path=$SHAREGPT_PATH"
   echo "base_url=$BASE_URL"
+  echo "progress_interval_sec=$PROGRESS_INTERVAL_SEC"
   echo "scenarios=$SCENARIOS"
   echo "seeds=$SEEDS"
   if command -v git >/dev/null 2>&1; then
@@ -72,6 +74,7 @@ for scenario in $SCENARIOS; do
   for seed in $SEEDS; do
     out_csv="$OUTPUT_ROOT/${scenario}_seed${seed}_requests.csv"
     out_json="$OUTPUT_ROOT/${scenario}_seed${seed}_summary.json"
+    out_progress_json="$OUTPUT_ROOT/${scenario}_seed${seed}_progress_live.json"
 
     echo "[RUN] scenario=$scenario seed=$seed"
     "$PYTHON_BIN" "$BENCH_SCRIPT" \
@@ -83,6 +86,8 @@ for scenario in $SCENARIOS; do
       --scenario-name "$scenario" \
       --seed "$seed" \
       --request-timeout-sec "$REQUEST_TIMEOUT_SEC" \
+      --progress-interval-sec "$PROGRESS_INTERVAL_SEC" \
+      --progress-summary-json "$out_progress_json" \
       --output-csv "$out_csv" \
       --summary-json "$out_json"
   done
