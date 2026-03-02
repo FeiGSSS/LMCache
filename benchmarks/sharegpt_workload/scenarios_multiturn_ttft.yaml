@@ -15,12 +15,12 @@ scenarios:
   - name: target_10_inflight_600s
     num-users: 4000
     max-inflight-requests: 10
-    new-user-rate: 0.8
+    new-user-rate: 30.0
     duration-sec: 600
     seed: 42
-    think-base-sec: 1.0
-    read-tok-per-sec: 5.0
-    think-sigma: 0.6
+    think-base-sec: 0.05
+    read-tok-per-sec: 300.0
+    think-sigma: 0.2
     max-context-tokens: 8192
     max-output-tokens: 1
     request-timeout-sec: 120
@@ -28,12 +28,12 @@ scenarios:
   - name: scan_arrival_low
     num-users: 3000
     max-inflight-requests: 10
-    new-user-rate: 0.4
+    new-user-rate: 10.0
     duration-sec: 600
     seed: 42
-    think-base-sec: 1.0
-    read-tok-per-sec: 5.0
-    think-sigma: 0.6
+    think-base-sec: 0.05
+    read-tok-per-sec: 300.0
+    think-sigma: 0.2
     max-context-tokens: 8192
     max-output-tokens: 1
     request-timeout-sec: 120
@@ -41,12 +41,12 @@ scenarios:
   - name: scan_arrival_mid
     num-users: 3000
     max-inflight-requests: 10
-    new-user-rate: 0.8
+    new-user-rate: 30.0
     duration-sec: 600
     seed: 42
-    think-base-sec: 1.0
-    read-tok-per-sec: 5.0
-    think-sigma: 0.6
+    think-base-sec: 0.05
+    read-tok-per-sec: 300.0
+    think-sigma: 0.2
     max-context-tokens: 8192
     max-output-tokens: 1
     request-timeout-sec: 120
@@ -54,12 +54,12 @@ scenarios:
   - name: scan_arrival_high
     num-users: 3000
     max-inflight-requests: 10
-    new-user-rate: 1.2
+    new-user-rate: 60.0
     duration-sec: 600
     seed: 42
-    think-base-sec: 1.0
-    read-tok-per-sec: 5.0
-    think-sigma: 0.6
+    think-base-sec: 0.05
+    read-tok-per-sec: 300.0
+    think-sigma: 0.2
     max-context-tokens: 8192
     max-output-tokens: 1
     request-timeout-sec: 120
@@ -67,12 +67,12 @@ scenarios:
   - name: scan_inflight_3
     num-users: 3000
     max-inflight-requests: 3
-    new-user-rate: 0.8
+    new-user-rate: 30.0
     duration-sec: 600
     seed: 42
-    think-base-sec: 1.0
-    read-tok-per-sec: 5.0
-    think-sigma: 0.6
+    think-base-sec: 0.05
+    read-tok-per-sec: 300.0
+    think-sigma: 0.2
     max-context-tokens: 8192
     max-output-tokens: 1
     request-timeout-sec: 120
@@ -80,12 +80,12 @@ scenarios:
   - name: scan_inflight_5
     num-users: 3000
     max-inflight-requests: 5
-    new-user-rate: 0.8
+    new-user-rate: 30.0
     duration-sec: 600
     seed: 42
-    think-base-sec: 1.0
-    read-tok-per-sec: 5.0
-    think-sigma: 0.6
+    think-base-sec: 0.05
+    read-tok-per-sec: 300.0
+    think-sigma: 0.2
     max-context-tokens: 8192
     max-output-tokens: 1
     request-timeout-sec: 120
@@ -93,12 +93,12 @@ scenarios:
   - name: scan_inflight_10
     num-users: 3000
     max-inflight-requests: 10
-    new-user-rate: 0.8
+    new-user-rate: 30.0
     duration-sec: 600
     seed: 42
-    think-base-sec: 1.0
-    read-tok-per-sec: 5.0
-    think-sigma: 0.6
+    think-base-sec: 0.05
+    read-tok-per-sec: 300.0
+    think-sigma: 0.2
     max-context-tokens: 8192
     max-output-tokens: 1
     request-timeout-sec: 120
@@ -106,12 +106,12 @@ scenarios:
   - name: scan_inflight_20
     num-users: 3000
     max-inflight-requests: 20
-    new-user-rate: 0.8
+    new-user-rate: 30.0
     duration-sec: 600
     seed: 42
-    think-base-sec: 1.0
-    read-tok-per-sec: 5.0
-    think-sigma: 0.6
+    think-base-sec: 0.05
+    read-tok-per-sec: 300.0
+    think-sigma: 0.2
     max-context-tokens: 8192
     max-output-tokens: 1
     request-timeout-sec: 120

@@ -69,6 +69,11 @@ tail -f outputs/sharegpt_dev_baseline_*/target_10_inflight_600s_seed41_progress_
 4. 并发闸门扫描：`scan_inflight_3/5/10/20`
 5. 重复性：每场景 `seed=41,42,43`
 
+当前默认高压参数（用于更快触发排队与并发）：
+1. `target_10_inflight_600s` 使用 `new_user_rate=30.0`
+2. 扫描场景统一使用低 think-time：`think_base_sec=0.05`, `read_tok_per_sec=300.0`, `think_sigma=0.2`
+3. 到达率扫描档位：`10.0 / 30.0 / 60.0`
+
 ## 核心指标与对比口径
 1. 主指标：`ttft_server_p50/p90/p95/p99`
 2. 并发闸门解释项：`ttft_effective_*`, `client_queue_wait_p50/p95`
