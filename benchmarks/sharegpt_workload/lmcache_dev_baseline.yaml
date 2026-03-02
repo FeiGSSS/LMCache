@@ -1,0 +1,11 @@
+# LMCache dev baseline config for ShareGPT multiturn TTFT benchmark.
+# Baseline definition: upstream/dev official behavior, no custom scheduling optimization.
+
+# Core cache settings
+chunk_size: 256
+local_cpu: true
+max_local_cpu_size: 120
+save_unfull_chunk: false
+
+# Keep quantization explicitly disabled for baseline comparability.
+enable_kv_quantization: false

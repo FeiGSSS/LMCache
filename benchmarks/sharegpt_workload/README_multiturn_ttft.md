@@ -16,6 +16,11 @@ Phase-1 设计约束：
 2. `/Users/philip/research/KVCache/LMCache/benchmarks/sharegpt_workload/scenarios_multiturn_ttft.yaml`
 3. `/Users/philip/research/KVCache/LMCache/benchmarks/sharegpt_workload/README_multiturn_ttft.md`
 
+## Baseline 方案
+1. baseline 文档：`/Users/philip/research/KVCache/LMCache/benchmarks/sharegpt_workload/README_dev_baseline.md`
+2. baseline 配置：`/Users/philip/research/KVCache/LMCache/benchmarks/sharegpt_workload/lmcache_dev_baseline.yaml`
+3. baseline 批跑脚本：`/Users/philip/research/KVCache/LMCache/benchmarks/sharegpt_workload/run_dev_baseline_sharegpt.sh`
+
 ## 数据与输入格式
 - ShareGPT 文件为 JSON 数组，单条数据包含 `id` 和 `conversations`。
 - 脚本从 `conversations` 中抽取交替 user/assistant 对；仅保留轮数 >= 2 的会话。
