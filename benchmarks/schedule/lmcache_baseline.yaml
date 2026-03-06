@@ -1,0 +1,5 @@
+# LMCache Baseline Configuration
+# 用于多轮对话场景的 KV Cache 复用测试
+chunk_size: 256
+local_cpu: True
+max_local_cpu_size: 80
