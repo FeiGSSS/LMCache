@@ -292,6 +292,7 @@ class StorageManager:
             self.hotness_policy = HotnessPolicy()
             self._reconcile_hotness_residency()
             self.tier_manager = TierManager(self, self.hotness_policy)
+            self._refresh_cpu_pressure_handler()
             self.tier_manager.start()
         self._setup_metrics()
 
@@ -371,6 +372,15 @@ class StorageManager:
         if self.hotness_policy is None:
             return
         self.hotness_policy.on_hit(key)
+
+    def _refresh_cpu_pressure_handler(self) -> None:
+        if not isinstance(self.local_cpu_backend, LocalCPUBackend):
+            return
+
+        handler: Optional[Callable[[], bool]] = None
+        if self.tier_manager is not None:
+            handler = self.tier_manager.ensure_cpu_headroom
+        self.local_cpu_backend.set_pressure_handler(handler)
 
     def _reconcile_hotness_residency(self) -> None:
         if self.hotness_policy is None:
@@ -1306,6 +1316,10 @@ class StorageManager:
 
             try:
                 logger.info("Closing backend: %s", backend_name)
+                if backend_name == "LocalCPUBackend" and isinstance(
+                    backend, LocalCPUBackend
+                ):
+                    backend.set_pressure_handler(None)
                 backend.close()
             except Exception:
                 logger.exception("Error closing backend %s", backend_name)
@@ -1365,6 +1379,7 @@ class StorageManager:
             if cpu is not None:
                 self.local_cpu_backend = cpu
 
+        self._refresh_cpu_pressure_handler()
         if self.hotness_policy is not None:
             self._reconcile_hotness_residency()
         return created
@@ -1396,6 +1411,10 @@ class StorageManager:
             # --- close ---
             try:
                 logger.info("Closing backend: %s", backend_name)
+                if backend_name == "LocalCPUBackend" and isinstance(
+                    backend, LocalCPUBackend
+                ):
+                    backend.set_pressure_handler(None)
                 backend.close()
             except Exception:
                 logger.exception("Error closing backend %s", backend_name)
@@ -1431,6 +1450,7 @@ class StorageManager:
             elif backend_name == "LocalCPUBackend":
                 self.local_cpu_backend = None
 
+        self._refresh_cpu_pressure_handler()
         if self.hotness_policy is not None:
             self._reconcile_hotness_residency()
         return created
@@ -1440,11 +1460,14 @@ class StorageManager:
 
         if self.tier_manager is not None:
             self.tier_manager.stop()
+        self._refresh_cpu_pressure_handler()
 
         # Close all backends
         for name, backend in self.storage_backends.items():
             try:
                 logger.info(f"Closing storage backend: {name}")
+                if name == "LocalCPUBackend" and isinstance(backend, LocalCPUBackend):
+                    backend.set_pressure_handler(None)
                 backend.close()
                 logger.info(f"Storage backend {name} closed successfully")
             except Exception as e:

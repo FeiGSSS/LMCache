@@ -31,6 +31,7 @@ import torch
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.event_manager import EventManager, EventType
 from lmcache.v1.metadata import LMCacheMetadata
+from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
 from lmcache.v1.storage_backend import tier_manager as tier_manager_module
 from lmcache.v1.storage_backend.storage_manager import StorageManager
 
@@ -371,6 +372,50 @@ def test_hotness_tier_manager_thread_runs(event_manager, monkeypatch):
 
     assert calls["count"] > 0
     assert not manager.is_tier_manager_running()
+
+
+def test_hotness_registers_cpu_pressure_handler(event_manager, monkeypatch):
+    calls = []
+    original_set_pressure_handler = LocalCPUBackend.set_pressure_handler
+
+    def wrapped_set_pressure_handler(self, handler):
+        calls.append(handler)
+        return original_set_pressure_handler(self, handler)
+
+    monkeypatch.setattr(
+        LocalCPUBackend,
+        "set_pressure_handler",
+        wrapped_set_pressure_handler,
+    )
+
+    config = LMCacheEngineConfig.from_defaults(
+        chunk_size=256,
+        local_cpu=True,
+        max_local_cpu_size=0.01,
+        cache_policy="HOTNESS",
+        lmcache_instance_id="test_instance",
+    )
+    metadata = LMCacheMetadata(
+        model_name="test_model",
+        world_size=1,
+        local_world_size=1,
+        worker_id=0,
+        local_worker_id=0,
+        kv_dtype=torch.bfloat16,
+        kv_shape=(28, 2, 256, 8, 128),
+        role="worker",
+    )
+    manager = StorageManager(
+        config=config,
+        metadata=metadata,
+        event_manager=event_manager,
+    )
+
+    try:
+        assert calls
+        assert calls[-1] is not None
+    finally:
+        manager.close()
 
 
 def test_non_hotness_policy_does_not_start_aging_thread(event_manager):

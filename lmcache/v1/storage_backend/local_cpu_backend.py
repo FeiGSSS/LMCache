@@ -77,6 +77,8 @@ class LocalCPUBackend(AllocatorBackendInterface):
         self.lmcache_worker = lmcache_worker
         self.instance_id = config.lmcache_instance_id
         self.cpu_lock = threading.Lock()
+        self._pressure_handler: Optional[Callable[[], bool]] = None
+        self._pressure_handler_lock = threading.Lock()
 
         self.stats_monitor = LMCStatsMonitor.GetOrCreate()
 
@@ -146,6 +148,23 @@ class LocalCPUBackend(AllocatorBackendInterface):
     def requires_policy_maintenance(self) -> bool:
         """Report whether the configured policy needs background maintenance."""
         return self.cache_policy.requires_periodic_maintenance()
+
+    def set_pressure_handler(
+        self,
+        handler: Optional[Callable[[], bool]],
+    ) -> None:
+        """
+        Register a synchronous CPU-pressure handler.
+
+        The handler is invoked after the first allocator failure and before the
+        backend falls back to its local eviction policy.
+
+        Args:
+            handler: Callable that tries to create CPU headroom and returns
+                whether it made progress. ``None`` clears the current handler.
+        """
+        with self._pressure_handler_lock:
+            self._pressure_handler = handler
 
     def exists_in_put_tasks(self, key: CacheEngineKey) -> bool:
         """
@@ -551,6 +570,11 @@ class LocalCPUBackend(AllocatorBackendInterface):
         if memory_obj is not None or not eviction:
             return memory_obj
 
+        if self._maybe_relieve_pressure():
+            memory_obj = self.memory_allocator.allocate(shapes, dtypes, fmt)
+            if memory_obj is not None:
+                return memory_obj
+
         evict_keys_count = 0
         num_attempts = 0
         while True:
@@ -658,6 +682,13 @@ class LocalCPUBackend(AllocatorBackendInterface):
 
         if memory_objs is not None or not eviction:
             return memory_objs
+
+        if self._maybe_relieve_pressure():
+            memory_objs = self.memory_allocator.batched_allocate(
+                shapes, dtypes, batch_size, fmt
+            )
+            if memory_objs is not None:
+                return memory_objs
 
         assert isinstance(self.memory_allocator, MixedMemoryAllocator)
 
@@ -850,5 +881,18 @@ class LocalCPUBackend(AllocatorBackendInterface):
     def close(self) -> None:
         if self.batched_msg_sender is not None:
             self.batched_msg_sender.close()
+
+    def _maybe_relieve_pressure(self) -> bool:
+        with self._pressure_handler_lock:
+            handler = self._pressure_handler
+
+        if handler is None:
+            return False
+
+        try:
+            return bool(handler())
+        except Exception:
+            logger.exception("CPU pressure handler failed")
+            return False
         self.memory_allocator.close()
         self.clear()

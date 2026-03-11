@@ -41,6 +41,27 @@ class MockLMCacheWorker:
             self.messages.append(msg)
 
 
+class FakePressureAllocator:
+    def __init__(self, allocate_results=None, batched_allocate_results=None):
+        self.allocate_results = list(allocate_results or [])
+        self.batched_allocate_results = list(batched_allocate_results or [])
+
+    def allocate(self, shapes, dtypes, fmt):
+        _ = (shapes, dtypes, fmt)
+        if self.allocate_results:
+            return self.allocate_results.pop(0)
+        return None
+
+    def batched_allocate(self, shapes, dtypes, batch_size, fmt):
+        _ = (shapes, dtypes, batch_size, fmt)
+        if self.batched_allocate_results:
+            return self.batched_allocate_results.pop(0)
+        return None
+
+    def close(self):
+        return None
+
+
 def create_test_config(
     local_cpu: bool = True,
     use_layerwise: bool = False,
@@ -474,6 +495,102 @@ class TestLocalCPUBackend:
             assert memory_obj.metadata.dtype == dtype
 
         local_cpu_backend.memory_allocator.close()
+
+    def test_allocate_invokes_pressure_handler_before_lru_fallback(self):
+        """Test allocate() tries the pressure handler before local eviction."""
+        config = create_test_config()
+        PinMonitor.GetOrCreate(config)
+        expected_obj = create_test_memory_obj()
+        allocator = FakePressureAllocator(allocate_results=[None, expected_obj])
+        backend = LocalCPUBackend(config=config, memory_allocator=allocator)
+
+        calls = {"count": 0}
+
+        def handler() -> bool:
+            calls["count"] += 1
+            return True
+
+        backend.set_pressure_handler(handler)
+        original_get_evict_candidates = backend.cache_policy.get_evict_candidates
+
+        def fail_get_evict_candidates(*args, **kwargs):
+            _ = (args, kwargs)
+            raise AssertionError("LRU fallback should not run")
+
+        backend.cache_policy.get_evict_candidates = fail_get_evict_candidates
+
+        try:
+            memory_obj = backend.allocate(torch.Size([2, 16, 8, 128]), torch.bfloat16)
+            assert memory_obj is expected_obj
+            assert calls["count"] == 1
+        finally:
+            backend.cache_policy.get_evict_candidates = original_get_evict_candidates
+            PinMonitor.DestroyInstance()
+
+    def test_allocate_keeps_lru_fallback_when_pressure_handler_fails(self):
+        """Test allocate() still falls back to local eviction after a failed handler."""
+        config = create_test_config()
+        PinMonitor.GetOrCreate(config)
+        expected_obj = create_test_memory_obj()
+        allocator = FakePressureAllocator(allocate_results=[None, expected_obj])
+        backend = LocalCPUBackend(config=config, memory_allocator=allocator)
+
+        key = create_test_key("fallback_key")
+        cached_obj = create_test_memory_obj()
+        backend.submit_put_task(key, cached_obj)
+
+        calls = {"count": 0}
+
+        def handler() -> bool:
+            calls["count"] += 1
+            return False
+
+        backend.set_pressure_handler(handler)
+
+        try:
+            memory_obj = backend.allocate(torch.Size([2, 16, 8, 128]), torch.bfloat16)
+            assert memory_obj is expected_obj
+            assert calls["count"] == 1
+            assert not backend.contains(key)
+        finally:
+            PinMonitor.DestroyInstance()
+
+    def test_batched_allocate_invokes_pressure_handler_before_lru_fallback(self):
+        """Test batched_allocate() tries the pressure handler before local eviction."""
+        config = create_test_config()
+        PinMonitor.GetOrCreate(config)
+        expected_objs = [create_test_memory_obj() for _ in range(2)]
+        allocator = FakePressureAllocator(
+            batched_allocate_results=[None, expected_objs]
+        )
+        backend = LocalCPUBackend(config=config, memory_allocator=allocator)
+
+        calls = {"count": 0}
+
+        def handler() -> bool:
+            calls["count"] += 1
+            return True
+
+        backend.set_pressure_handler(handler)
+        original_get_evict_candidates = backend.cache_policy.get_evict_candidates
+
+        def fail_get_evict_candidates(*args, **kwargs):
+            _ = (args, kwargs)
+            raise AssertionError("LRU fallback should not run")
+
+        backend.cache_policy.get_evict_candidates = fail_get_evict_candidates
+
+        try:
+            memory_objs = backend.batched_allocate(
+                torch.Size([2, 16, 8, 128]),
+                torch.bfloat16,
+                batch_size=2,
+            )
+            assert memory_objs is expected_objs
+            assert calls["count"] == 1
+        finally:
+            backend.cache_policy.get_evict_candidates = original_get_evict_candidates
+            PinMonitor.DestroyInstance()
 
     def test_get_keys(self, local_cpu_backend):
         """Test get_keys()."""
