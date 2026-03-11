@@ -133,6 +133,10 @@ class LocalDiskBackend(StorageBackendInterface):
         self.loop = loop
 
         self.use_local_cpu = config.local_cpu
+        self._internal_evict_callback: Optional[Callable[[CacheEngineKey], None]] = (
+            None
+        )
+        self._internal_evict_callback_lock = threading.Lock()
 
         # Block size (for file system I/O)
         stat = os.statvfs(self.path)
@@ -212,6 +216,20 @@ class LocalDiskBackend(StorageBackendInterface):
     def exists_in_put_tasks(self, key: CacheEngineKey) -> bool:
         return self.disk_worker.exists_in_put_tasks(key)
 
+    def set_internal_evict_callback(
+        self,
+        callback: Optional[Callable[[CacheEngineKey], None]],
+    ) -> None:
+        """
+        Register a callback for backend-initiated evictions.
+
+        Args:
+            callback: Invoked after a key is evicted internally by this backend.
+                ``None`` clears the current callback.
+        """
+        with self._internal_evict_callback_lock:
+            self._internal_evict_callback = callback
+
     def pin(
         self,
         key: CacheEngineKey,
@@ -272,6 +290,8 @@ class LocalDiskBackend(StorageBackendInterface):
                 key=key.chunk_hash,
             )
 
+        if not force:
+            self._notify_internal_evict(key)
         return True
 
     def insert_key(
@@ -641,6 +661,7 @@ class LocalDiskBackend(StorageBackendInterface):
             logger.warning(f"File not found on disk: {path}")
             if self.dict.get(key, None):
                 self.dict.pop(key)
+                self._notify_internal_evict(key)
             return
 
         disk_read_time = time.time() - start_time
@@ -675,3 +696,15 @@ class LocalDiskBackend(StorageBackendInterface):
         if self.batched_msg_sender is not None:
             self.batched_msg_sender.close()
         self.disk_worker.close()
+
+    def _notify_internal_evict(self, key: CacheEngineKey) -> None:
+        with self._internal_evict_callback_lock:
+            callback = self._internal_evict_callback
+
+        if callback is None:
+            return
+
+        try:
+            callback(key)
+        except Exception:
+            logger.exception("Internal disk eviction callback failed for key %s", key)

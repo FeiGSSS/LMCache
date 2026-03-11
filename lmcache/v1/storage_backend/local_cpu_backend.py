@@ -78,7 +78,12 @@ class LocalCPUBackend(AllocatorBackendInterface):
         self.instance_id = config.lmcache_instance_id
         self.cpu_lock = threading.Lock()
         self._pressure_handler: Optional[Callable[[], bool]] = None
+        self._pressure_high_watermark: Optional[float] = None
         self._pressure_handler_lock = threading.Lock()
+        self._internal_evict_callback: Optional[Callable[[CacheEngineKey], None]] = (
+            None
+        )
+        self._internal_evict_callback_lock = threading.Lock()
 
         self.stats_monitor = LMCStatsMonitor.GetOrCreate()
 
@@ -152,6 +157,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
     def set_pressure_handler(
         self,
         handler: Optional[Callable[[], bool]],
+        high_watermark: Optional[float] = None,
     ) -> None:
         """
         Register a synchronous CPU-pressure handler.
@@ -162,9 +168,26 @@ class LocalCPUBackend(AllocatorBackendInterface):
         Args:
             handler: Callable that tries to create CPU headroom and returns
                 whether it made progress. ``None`` clears the current handler.
+            high_watermark: Optional CPU usage ratio that triggers the handler
+                immediately after an admit when exceeded.
         """
         with self._pressure_handler_lock:
             self._pressure_handler = handler
+            self._pressure_high_watermark = high_watermark
+
+    def set_internal_evict_callback(
+        self,
+        callback: Optional[Callable[[CacheEngineKey], None]],
+    ) -> None:
+        """
+        Register a callback for backend-initiated evictions.
+
+        Args:
+            callback: Invoked after a key is evicted internally by this backend.
+                ``None`` clears the current callback.
+        """
+        with self._internal_evict_callback_lock:
+            self._internal_evict_callback = callback
 
     def exists_in_put_tasks(self, key: CacheEngineKey) -> bool:
         """
@@ -211,6 +234,9 @@ class LocalCPUBackend(AllocatorBackendInterface):
                 on_complete_callback(key)
             except Exception as e:
                 logger.warning(f"on_complete_callback failed for key {key}: {e}")
+
+        if stored:
+            self._maybe_relieve_post_admit_pressure()
 
         return None
 
@@ -327,6 +353,32 @@ class LocalCPUBackend(AllocatorBackendInterface):
         # NOTE (Jiayi): This `return True` might not accurately reflect
         # whether the key is removed from the actual memory because
         # other backends might still (temporarily) hold the memory object.
+        if not force:
+            self._notify_internal_evict(key)
+        return True
+
+    def remove_if_evictable(self, key: CacheEngineKey) -> bool:
+        """
+        Remove a key only when the resident object is currently evictable.
+
+        Returns:
+            ``True`` if the key was evicted from CPU cache, ``False`` otherwise.
+        """
+        with self.cpu_lock:
+            memory_obj = self.hot_cache.get(key)
+            if memory_obj is None:
+                return False
+            if not memory_obj.can_evict:
+                return False
+            self.hot_cache.pop(key, None)
+            memory_obj.ref_count_down()
+            self.cache_policy.update_on_force_evict(key)
+
+        if self.batched_msg_sender is not None:
+            self.batched_msg_sender.add_kv_op(
+                op_type=OpType.EVICT,
+                key=key.chunk_hash,
+            )
         return True
 
     def _calculate_effective_cpu_size(
@@ -724,6 +776,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
                                 old_mem_objs.append(self.hot_cache[key])
                                 self.cache_policy.update_on_force_evict(key)
                                 self.hot_cache.pop(key, None)
+                                self._notify_internal_evict(key)
 
                             self.memory_allocator.batched_free(old_mem_objs)
 
@@ -881,6 +934,8 @@ class LocalCPUBackend(AllocatorBackendInterface):
     def close(self) -> None:
         if self.batched_msg_sender is not None:
             self.batched_msg_sender.close()
+        self.memory_allocator.close()
+        self.clear()
 
     def _maybe_relieve_pressure(self) -> bool:
         with self._pressure_handler_lock:
@@ -894,5 +949,36 @@ class LocalCPUBackend(AllocatorBackendInterface):
         except Exception:
             logger.exception("CPU pressure handler failed")
             return False
-        self.memory_allocator.close()
-        self.clear()
+
+    def _maybe_relieve_post_admit_pressure(self) -> None:
+        with self._pressure_handler_lock:
+            handler = self._pressure_handler
+            high_watermark = self._pressure_high_watermark
+
+        if handler is None or high_watermark is None:
+            return
+
+        capacity_bytes = self.get_capacity_bytes()
+        if capacity_bytes <= 0:
+            return
+
+        usage_bytes = self.get_usage_bytes()
+        if usage_bytes <= capacity_bytes * high_watermark:
+            return
+
+        try:
+            handler()
+        except Exception:
+            logger.exception("Post-admit CPU pressure handler failed")
+
+    def _notify_internal_evict(self, key: CacheEngineKey) -> None:
+        with self._internal_evict_callback_lock:
+            callback = self._internal_evict_callback
+
+        if callback is None:
+            return
+
+        try:
+            callback(key)
+        except Exception:
+            logger.exception("Internal CPU eviction callback failed for key %s", key)

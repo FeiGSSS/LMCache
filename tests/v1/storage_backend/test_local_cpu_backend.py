@@ -45,6 +45,7 @@ class FakePressureAllocator:
     def __init__(self, allocate_results=None, batched_allocate_results=None):
         self.allocate_results = list(allocate_results or [])
         self.batched_allocate_results = list(batched_allocate_results or [])
+        self.close_calls = 0
 
     def allocate(self, shapes, dtypes, fmt):
         _ = (shapes, dtypes, fmt)
@@ -59,6 +60,7 @@ class FakePressureAllocator:
         return None
 
     def close(self):
+        self.close_calls += 1
         return None
 
 
@@ -608,6 +610,68 @@ class TestLocalCPUBackend:
         assert all(key in retrieved_keys for key in keys)
 
         local_cpu_backend.memory_allocator.close()
+
+    def test_submit_put_task_invokes_pressure_handler_after_crossing_watermark(self):
+        """Test admit path triggers pressure handler once usage exceeds high watermark."""
+        config = create_test_config()
+        config.max_local_cpu_size = 1e-6
+        PinMonitor.GetOrCreate(config)
+        allocator = FakePressureAllocator()
+        backend = LocalCPUBackend(config=config, memory_allocator=allocator)
+        key = create_test_key("pressure_on_admit")
+        memory_obj = create_test_memory_obj()
+        handler_calls = []
+
+        def handler() -> bool:
+            handler_calls.append("called")
+            return True
+
+        try:
+            backend.set_pressure_handler(handler, high_watermark=0.90)
+            backend.submit_put_task(key, memory_obj)
+            assert handler_calls == ["called"]
+        finally:
+            backend.close()
+            PinMonitor.DestroyInstance()
+
+    def test_submit_put_task_does_not_invoke_pressure_handler_below_watermark(self):
+        """Test admit path does not trigger pressure handler before high watermark."""
+        config = create_test_config()
+        PinMonitor.GetOrCreate(config)
+        allocator = FakePressureAllocator()
+        backend = LocalCPUBackend(config=config, memory_allocator=allocator)
+        key = create_test_key("pressure_below_admit")
+        memory_obj = create_test_memory_obj()
+        handler_calls = []
+
+        def handler() -> bool:
+            handler_calls.append("called")
+            return True
+
+        try:
+            backend.set_pressure_handler(handler, high_watermark=0.90)
+            backend.submit_put_task(key, memory_obj)
+            assert handler_calls == []
+        finally:
+            backend.close()
+            PinMonitor.DestroyInstance()
+
+    def test_close_releases_allocator_and_clears_cache(self):
+        """Test close() closes allocator and clears cached entries."""
+        config = create_test_config()
+        PinMonitor.GetOrCreate(config)
+        allocator = FakePressureAllocator()
+        backend = LocalCPUBackend(config=config, memory_allocator=allocator)
+        key = create_test_key("close_key")
+        memory_obj = create_test_memory_obj()
+        backend.submit_put_task(key, memory_obj)
+
+        try:
+            backend.close()
+            assert allocator.close_calls == 1
+            assert not backend.contains(key)
+        finally:
+            PinMonitor.DestroyInstance()
 
     def test_get_keys_empty(self, local_cpu_backend):
         """Test get_keys() when cache is empty."""

@@ -26,7 +26,11 @@ DEFAULT_MAX_ACTIONS_PER_TICK = 8
 
 class TierManager:
     """
-    Manage proactive demotion and promotion across storage tiers.
+    Manage periodic disk-to-CPU promotion across storage tiers.
+
+    CPU demotion is event-driven through ``ensure_cpu_headroom()`` via the
+    LocalCPU pressure handler. The background loop only refreshes hotness aging
+    and evaluates replacement promotions.
     """
 
     def __init__(
@@ -93,7 +97,7 @@ class TierManager:
 
     def run_once(self) -> None:
         """
-        Run one management iteration.
+        Run one promotion-management iteration.
         """
         self.hotness_policy.refresh()
         self.maybe_replace_promote_disk()
@@ -145,48 +149,13 @@ class TierManager:
             if self.replace_promote_key(disk_key, victim_key):
                 used_cpu_keys.add(victim_key)
 
-    def evict_cpu_until_below_watermark(
-        self,
-    ) -> None:
-        """
-        Proactively demote cold CPU keys until CPU usage drops below watermark.
-        """
-        cpu_backend = self._get_cpu_backend()
-        if cpu_backend is None:
-            return
-
-        capacity_bytes = cpu_backend.get_capacity_bytes()
-        if capacity_bytes <= 0:
-            return
-
-        usage_bytes = cpu_backend.get_usage_bytes()
-        if usage_bytes <= capacity_bytes * self.cpu_high_watermark:
-            return
-
-        target_bytes = int(capacity_bytes * self.cpu_low_watermark)
-        while usage_bytes > target_bytes:
-            candidates = self.hotness_policy.select_coldest(
-                Tier.CPU,
-                limit=self.max_actions_per_tick,
-            )
-            if not candidates:
-                break
-
-            made_progress = False
-            for key in candidates:
-                if self.demote_key(key):
-                    made_progress = True
-                    usage_bytes = cpu_backend.get_usage_bytes()
-                    if usage_bytes <= target_bytes:
-                        break
-
-            if not made_progress:
-                break
-
     def ensure_cpu_headroom(self) -> bool:
         """
         Synchronously demote CPU-resident keys until usage drops below the low
         watermark.
+
+        This method is the event-driven CPU demotion path used by the local CPU
+        pressure handler.
 
         Returns:
             True if any CPU headroom was created, otherwise False.
@@ -239,18 +208,11 @@ class TierManager:
         if cpu_backend is None or disk_backend is None:
             return False
 
-        memory_obj = disk_backend.get_blocking(key)
+        memory_obj = self._load_disk_memory_obj(disk_backend, key)
         if memory_obj is None:
-            self.hotness_policy.mark_resident(key, Tier.DISK, False)
             return False
 
-        already_in_cpu = cpu_backend.contains(key)
-        cpu_backend.submit_put_task(key, memory_obj)
-        if not already_in_cpu and cpu_backend.contains(key):
-            self.hotness_policy.mark_resident(key, Tier.CPU, True)
-
-        memory_obj.ref_count_down()
-        return True
+        return self._store_loaded_key_in_cpu(cpu_backend, key, memory_obj)
 
     def replace_promote_key(
         self,
@@ -264,17 +226,24 @@ class TierManager:
         disk copy so the victim can be removed from CPU immediately.
         """
         cpu_backend = self._get_cpu_backend()
-        if cpu_backend is None:
+        disk_backend = self._get_disk_backend()
+        if cpu_backend is None or disk_backend is None:
+            return False
+
+        memory_obj = self._load_disk_memory_obj(disk_backend, disk_key)
+        if memory_obj is None:
             return False
 
         victim_state = self.hotness_policy.get_state(victim_cpu_key)
         if victim_state is None or Tier.DISK not in victim_state.resident_tiers:
+            self._release_memory_obj(memory_obj)
             return False
-        if not cpu_backend.remove(victim_cpu_key):
+        if not self._remove_cpu_if_evictable(cpu_backend, victim_cpu_key):
+            self._release_memory_obj(memory_obj)
             return False
 
         self.hotness_policy.mark_resident(victim_cpu_key, Tier.CPU, False)
-        return self.promote_key(disk_key)
+        return self._store_loaded_key_in_cpu(cpu_backend, disk_key, memory_obj)
 
     def demote_key(self, key: CacheEngineKey, blocking: bool = False) -> bool:
         """
@@ -303,7 +272,7 @@ class TierManager:
             return False
 
         if hasattr(disk_backend, "contains") and disk_backend.contains(key):
-            if cpu_backend.remove(key):
+            if self._remove_cpu_if_evictable(cpu_backend, key):
                 self.hotness_policy.mark_resident(key, Tier.CPU, False)
                 self.hotness_policy.mark_resident(key, Tier.DISK, True)
                 return True
@@ -324,9 +293,9 @@ class TierManager:
 
         def _complete_demote(completed_key: CacheEngineKey) -> None:
             self.hotness_policy.mark_resident(completed_key, Tier.DISK, True)
-            if cpu_backend.remove(completed_key) or not cpu_backend.contains(
-                completed_key
-            ):
+            if self._remove_cpu_if_evictable(
+                cpu_backend, completed_key
+            ) or not cpu_backend.contains(completed_key):
                 self.hotness_policy.mark_resident(completed_key, Tier.CPU, False)
                 demote_state["completed"] = True
             memory_obj.ref_count_down()
@@ -363,6 +332,36 @@ class TierManager:
         disk_score = self.hotness_policy.get_score(key)
         return disk_score > cpu_floor_score + HOTNESS_PROMOTION_MARGIN
 
+    def _load_disk_memory_obj(
+        self,
+        disk_backend: object,
+        key: CacheEngineKey,
+    ) -> Optional[object]:
+        memory_obj = disk_backend.get_blocking(key)
+        if memory_obj is None:
+            self.hotness_policy.mark_resident(key, Tier.DISK, False)
+            return None
+        return memory_obj
+
+    def _store_loaded_key_in_cpu(
+        self,
+        cpu_backend: object,
+        key: CacheEngineKey,
+        memory_obj: object,
+    ) -> bool:
+        already_in_cpu = cpu_backend.contains(key)
+        cpu_backend.submit_put_task(key, memory_obj)
+        promoted = already_in_cpu or cpu_backend.contains(key)
+        if promoted and not already_in_cpu:
+            self.hotness_policy.mark_resident(key, Tier.CPU, True)
+
+        self._release_memory_obj(memory_obj)
+        return promoted
+
+    def _release_memory_obj(self, memory_obj: object) -> None:
+        if hasattr(memory_obj, "ref_count_down"):
+            memory_obj.ref_count_down()
+
     def _get_cpu_backend(self) -> Optional[object]:
         backend = self.storage_manager.storage_backends.get("LocalCPUBackend")
         if backend is None:
@@ -371,6 +370,7 @@ class TierManager:
             "get_capacity_bytes",
             "get_usage_bytes",
             "remove",
+            "remove_if_evictable",
             "contains",
             "get_blocking",
             "submit_put_task",
@@ -378,6 +378,13 @@ class TierManager:
         if all(hasattr(backend, method_name) for method_name in required_methods):
             return cast(object, backend)
         return None
+
+    def _remove_cpu_if_evictable(
+        self, cpu_backend: object, key: CacheEngineKey
+    ) -> bool:
+        if not hasattr(cpu_backend, "remove_if_evictable"):
+            return False
+        return bool(cpu_backend.remove_if_evictable(key))
 
     def _get_disk_backend(self) -> Optional[object]:
         backend = self.storage_manager.storage_backends.get("LocalDiskBackend")

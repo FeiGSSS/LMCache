@@ -21,6 +21,8 @@ Key scenarios tested:
 
 # Standard
 import asyncio
+from collections import OrderedDict
+from concurrent.futures import Future
 import time
 
 # Third Party
@@ -33,7 +35,9 @@ from lmcache.v1.event_manager import EventManager, EventType
 from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
 from lmcache.v1.storage_backend import tier_manager as tier_manager_module
+from lmcache.v1.storage_backend.hotness_policy import HotnessPolicy, Tier
 from lmcache.v1.storage_backend.storage_manager import StorageManager
+from tests.v1.utils import dumb_cache_engine_key
 
 
 class MockMemoryObj:
@@ -378,9 +382,9 @@ def test_hotness_registers_cpu_pressure_handler(event_manager, monkeypatch):
     calls = []
     original_set_pressure_handler = LocalCPUBackend.set_pressure_handler
 
-    def wrapped_set_pressure_handler(self, handler):
-        calls.append(handler)
-        return original_set_pressure_handler(self, handler)
+    def wrapped_set_pressure_handler(self, handler, high_watermark=None):
+        calls.append((handler, high_watermark))
+        return original_set_pressure_handler(self, handler, high_watermark)
 
     monkeypatch.setattr(
         LocalCPUBackend,
@@ -413,7 +417,8 @@ def test_hotness_registers_cpu_pressure_handler(event_manager, monkeypatch):
 
     try:
         assert calls
-        assert calls[-1] is not None
+        assert calls[-1][0] is not None
+        assert calls[-1][1] is not None
     finally:
         manager.close()
 
@@ -446,3 +451,124 @@ def test_non_hotness_policy_does_not_start_aging_thread(event_manager):
         assert not manager.is_tier_manager_running()
     finally:
         manager.close()
+
+
+def test_get_non_blocking_updates_hotness(storage_manager):
+    class FakeBackend:
+        def get_non_blocking(self, key):
+            _ = key
+            future = Future()
+            future.set_result(object())
+            return future
+
+    key = dumb_cache_engine_key(801)
+    storage_manager.hotness_policy = HotnessPolicy()
+    storage_manager.storage_backends = OrderedDict([("FakeBackend", FakeBackend())])
+
+    task = storage_manager.get_non_blocking(key, location="FakeBackend")
+    assert task is not None
+    _ = task.result()
+
+    state = storage_manager.hotness_policy.get_state(key)
+    assert state is not None
+    assert state.hit_count == 1
+
+
+def test_layerwise_batched_get_updates_hotness(storage_manager):
+    class FakeBackend:
+        async def batched_get_non_blocking(self, lookup_id, keys, transfer_spec=None):
+            _ = (lookup_id, transfer_spec)
+            return [object() for _ in keys]
+
+    key1 = dumb_cache_engine_key(811)
+    key2 = dumb_cache_engine_key(812)
+    storage_manager.hotness_policy = HotnessPolicy()
+    storage_manager.storage_backends = OrderedDict([("FakeBackend", FakeBackend())])
+
+    futures = list(
+        storage_manager.layerwise_batched_get(
+            [[key1, key2]],
+            location="FakeBackend",
+        )
+    )
+    assert len(futures) == 1
+    _ = futures[0].result()
+
+    state1 = storage_manager.hotness_policy.get_state(key1)
+    state2 = storage_manager.hotness_policy.get_state(key2)
+    assert state1 is not None
+    assert state2 is not None
+    assert state1.hit_count == 1
+    assert state2.hit_count == 1
+
+
+def test_prefetch_callback_with_keyed_results_updates_hotness(storage_manager):
+    key1 = dumb_cache_engine_key(821)
+    key2 = dumb_cache_engine_key(822)
+    obj1 = MockMemoryObj(1)
+    obj2 = MockMemoryObj(2)
+    storage_manager.hotness_policy = HotnessPolicy()
+
+    cum_chunk_lengths_total = [0, 256, 512]
+    tier_expected_chunks = [2]
+    res = [[(key1, obj1), (key2, obj2)]]
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    future = loop.create_future()
+    future.set_result(res)
+
+    storage_manager.event_manager.add_event(
+        EventType.LOADING, "test_lookup_hotness", future
+    )
+    storage_manager.prefetch_all_done_callback(
+        future,
+        "test_lookup_hotness",
+        cum_chunk_lengths_total,
+        tier_expected_chunks,
+    )
+    loop.close()
+
+    state1 = storage_manager.hotness_policy.get_state(key1)
+    state2 = storage_manager.hotness_policy.get_state(key2)
+    assert state1 is not None
+    assert state2 is not None
+    assert state1.hit_count == 1
+    assert state2.hit_count == 1
+
+
+def test_clear_updates_hotness_tiers_without_reconcile(storage_manager):
+    class FakeBackend:
+        def __init__(self) -> None:
+            self.clear_calls = 0
+
+        def clear(self):
+            self.clear_calls += 1
+            return 1
+
+    cpu_key = dumb_cache_engine_key(831)
+    disk_key = dumb_cache_engine_key(832)
+
+    storage_manager.hotness_policy = HotnessPolicy()
+    storage_manager.hotness_policy.mark_resident(cpu_key, Tier.CPU, True)
+    storage_manager.hotness_policy.mark_resident(disk_key, Tier.DISK, True)
+    cpu_backend = FakeBackend()
+    disk_backend = FakeBackend()
+
+    storage_manager.storage_backends = OrderedDict(
+        [
+            ("LocalCPUBackend", cpu_backend),
+            ("LocalDiskBackend", disk_backend),
+        ]
+    )
+
+    assert storage_manager.clear(["LocalCPUBackend"]) == 1
+
+    cpu_state = storage_manager.hotness_policy.get_state(cpu_key)
+    disk_state = storage_manager.hotness_policy.get_state(disk_key)
+
+    assert cpu_state is None
+    assert disk_state is not None
+    assert disk_state.resident_tiers == {Tier.DISK}
+    assert cpu_backend.clear_calls == 1
+    assert disk_backend.clear_calls == 0

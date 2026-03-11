@@ -57,6 +57,7 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+
 # Helper function to get the class name of the backend
 def get_backend_cname(backend: StorageBackendInterface):
     return backend.__class__.__name__
@@ -290,9 +291,9 @@ class StorageManager:
 
         if self._is_hotness_enabled():
             self.hotness_policy = HotnessPolicy()
-            self._reconcile_hotness_residency()
             self.tier_manager = TierManager(self, self.hotness_policy)
             self._refresh_cpu_pressure_handler()
+            self._refresh_hotness_backend_hooks()
             self.tier_manager.start()
         self._setup_metrics()
 
@@ -373,29 +374,88 @@ class StorageManager:
             return
         self.hotness_policy.on_hit(key)
 
+    def _record_async_single_hit(
+        self,
+        key: CacheEngineKey,
+        task: Future,
+    ) -> None:
+        if self.hotness_policy is None:
+            return
+
+        def _done(done_task: Future) -> None:
+            try:
+                memory_obj = done_task.result()
+            except Exception:
+                return
+            if memory_obj is not None:
+                self._record_hit(key)
+
+        task.add_done_callback(_done)
+
+    def _record_async_batched_hits(
+        self,
+        keys: Sequence[CacheEngineKey],
+        task: Future,
+    ) -> None:
+        if self.hotness_policy is None:
+            return
+
+        def _done(done_task: Future) -> None:
+            try:
+                memory_objs = done_task.result()
+            except Exception:
+                return
+            if memory_objs is None:
+                return
+            for key, memory_obj in zip(keys, memory_objs, strict=False):
+                if memory_obj is not None:
+                    self._record_hit(key)
+
+        task.add_done_callback(_done)
+
+    def _make_internal_evict_callback(
+        self,
+        backend_name: str,
+    ) -> Optional[Callable[[CacheEngineKey], None]]:
+        tier = self._backend_name_to_tier(backend_name)
+        if tier is None or self.hotness_policy is None:
+            return None
+
+        def _callback(key: CacheEngineKey) -> None:
+            self._mark_resident(key, tier, False)
+
+        return _callback
+
     def _refresh_cpu_pressure_handler(self) -> None:
         if not isinstance(self.local_cpu_backend, LocalCPUBackend):
             return
 
         handler: Optional[Callable[[], bool]] = None
+        high_watermark: Optional[float] = None
         if self.tier_manager is not None:
             handler = self.tier_manager.ensure_cpu_headroom
-        self.local_cpu_backend.set_pressure_handler(handler)
+            high_watermark = self.tier_manager.cpu_high_watermark
+        self.local_cpu_backend.set_pressure_handler(handler, high_watermark)
 
-    def _reconcile_hotness_residency(self) -> None:
+    def _refresh_hotness_backend_hooks(self) -> None:
+        callback: Optional[Callable[[CacheEngineKey], None]]
+        for backend_name, backend in self.storage_backends.items():
+            if not hasattr(backend, "set_internal_evict_callback"):
+                continue
+
+            callback = None
+            if self.hotness_policy is not None:
+                callback = self._make_internal_evict_callback(backend_name)
+            cast(Any, backend).set_internal_evict_callback(callback)
+
+    def _clear_hotness_tier(self, backend_name: str) -> None:
         if self.hotness_policy is None:
             return
 
-        self.hotness_policy.clear_tier(Tier.CPU)
-        self.hotness_policy.clear_tier(Tier.DISK)
-        self.hotness_policy.clear_tier(Tier.REMOTE)
-
-        for backend_name, backend in self.storage_backends.items():
-            tier = self._backend_name_to_tier(backend_name)
-            if tier is None or not hasattr(backend, "list_resident_keys"):
-                continue
-            for key in backend.list_resident_keys():
-                self.hotness_policy.mark_resident(key, tier, True)
+        tier = self._backend_name_to_tier(backend_name)
+        if tier is None:
+            return
+        self.hotness_policy.clear_tier(tier)
 
     def _is_hotness_enabled(self) -> bool:
         return self.config.cache_policy.upper() == "HOTNESS"
@@ -573,6 +633,7 @@ class StorageManager:
             # NOTE(Jiayi): bypass the allocator for now
             task = backend.get_non_blocking(key)
             if task:
+                self._record_async_single_hit(key, task)
                 # TODO (Jiayi): add write-back logic here
                 return task
         return None
@@ -646,6 +707,7 @@ class StorageManager:
             # TODO(Jiayi): need to make async loading and layerwise compatible
             coro = backend.batched_get_non_blocking("fake_lookup_id", keys_multi_chunk)
             task = asyncio.run_coroutine_threadsafe(coro, self.loop)
+            self._record_async_batched_hits(keys_multi_chunk, task)
             yield task
 
     def prefetch_single_done_callback(
@@ -727,12 +789,18 @@ class StorageManager:
             expected_chunks = tier_expected_chunks[tier_idx]
             total_retrieved_chunks += actual_chunks
 
+            for entry in tier_result:
+                if isinstance(entry, tuple):
+                    key, _ = entry
+                    self._record_hit(key)
+
             # If a tier retrieved fewer chunks than expected, we stop counting
             # because subsequent chunks are not contiguous
             if actual_chunks < expected_chunks:
                 # Release all chunks in subsequent tiers since they won't be used
                 for subsequent_tier in res[tier_idx + 1 :]:
-                    for mem_obj in subsequent_tier:
+                    for entry in subsequent_tier:
+                        mem_obj = entry[1] if isinstance(entry, tuple) else entry
                         mem_obj.ref_count_down()
                 break
 
@@ -1205,14 +1273,12 @@ class StorageManager:
             if locations is None or backend_name in locations:
                 if hasattr(backend, "clear"):
                     num_cleared_tokens += backend.clear()
+                    self._clear_hotness_tier(backend_name)
                 else:
                     logger.warning(
                         f"Storage backend {backend_name} does not support "
                         "clear operation. Skipping."
                     )
-
-        if self.hotness_policy is not None:
-            self._reconcile_hotness_residency()
         return num_cleared_tokens
 
     def memcheck(self) -> bool:
@@ -1304,7 +1370,6 @@ class StorageManager:
             True if the backend was found and closed, False
             otherwise.
         """
-        refresh_thread_state = False
         with self.manager_lock:
             backend = self.storage_backends.get(backend_name)
             if backend is None:
@@ -1320,6 +1385,8 @@ class StorageManager:
                     backend, LocalCPUBackend
                 ):
                     backend.set_pressure_handler(None)
+                if hasattr(backend, "set_internal_evict_callback"):
+                    cast(Any, backend).set_internal_evict_callback(None)
                 backend.close()
             except Exception:
                 logger.exception("Error closing backend %s", backend_name)
@@ -1330,10 +1397,8 @@ class StorageManager:
             self.non_allocator_backends = self.get_non_allocator_backends()
             if backend_name == "LocalCPUBackend":
                 self.local_cpu_backend = None
-            refresh_thread_state = True
+            self._clear_hotness_tier(backend_name)
             logger.info("Backend %s closed and removed", backend_name)
-        if refresh_thread_state and self.hotness_policy is not None:
-            self._reconcile_hotness_residency()
         return True
 
     def create_backends(self) -> Dict[str, str]:
@@ -1380,8 +1445,7 @@ class StorageManager:
                 self.local_cpu_backend = cpu
 
         self._refresh_cpu_pressure_handler()
-        if self.hotness_policy is not None:
-            self._reconcile_hotness_residency()
+        self._refresh_hotness_backend_hooks()
         return created
 
     def recreate_backend(self, backend_name: str) -> Dict[str, str]:
@@ -1415,9 +1479,12 @@ class StorageManager:
                     backend, LocalCPUBackend
                 ):
                     backend.set_pressure_handler(None)
+                if hasattr(backend, "set_internal_evict_callback"):
+                    cast(Any, backend).set_internal_evict_callback(None)
                 backend.close()
             except Exception:
                 logger.exception("Error closing backend %s", backend_name)
+            self._clear_hotness_tier(backend_name)
             del self.storage_backends[backend_name]
 
             # --- create ---
@@ -1451,8 +1518,7 @@ class StorageManager:
                 self.local_cpu_backend = None
 
         self._refresh_cpu_pressure_handler()
-        if self.hotness_policy is not None:
-            self._reconcile_hotness_residency()
+        self._refresh_hotness_backend_hooks()
         return created
 
     def close(self):
@@ -1468,6 +1534,9 @@ class StorageManager:
                 logger.info(f"Closing storage backend: {name}")
                 if name == "LocalCPUBackend" and isinstance(backend, LocalCPUBackend):
                     backend.set_pressure_handler(None)
+                if hasattr(backend, "set_internal_evict_callback"):
+                    cast(Any, backend).set_internal_evict_callback(None)
+                self._clear_hotness_tier(name)
                 backend.close()
                 logger.info(f"Storage backend {name} closed successfully")
             except Exception as e:
