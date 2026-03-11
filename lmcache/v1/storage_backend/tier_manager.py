@@ -99,13 +99,18 @@ class TierManager:
         """
         Run one promotion-management iteration.
         """
-        self.hotness_policy.refresh()
-        self.maybe_replace_promote_disk()
+        with self._pressure_lock:
+            self.hotness_policy.refresh()
+            self._maybe_replace_promote_disk_locked()
 
     def maybe_replace_promote_disk(self) -> None:
         """
         Promote hot disk-only keys by replacing colder CPU keys.
         """
+        with self._pressure_lock:
+            self._maybe_replace_promote_disk_locked()
+
+    def _maybe_replace_promote_disk_locked(self) -> None:
         cpu_backend = self._get_cpu_backend()
         if cpu_backend is None:
             return

@@ -225,16 +225,13 @@ def CreateStorageBackends(
         storage_backends[str(gds_backend)] = gds_backend
 
     if config.remote_url is not None and "RemoteBackend" not in _skip:
-<<<<<<< HEAD
+        # First Party
+        from lmcache.v1.storage_backend.remote_backend import RemoteBackend
+
         assert local_cpu_backend is not None, (
             "Remote backend requires local CPU backend as a buffer."
             "Please turn on local cpu backend with max_local_cpu_size > 0"
         )
-=======
-        # First Party
-        from lmcache.v1.storage_backend.remote_backend import RemoteBackend
-
->>>>>>> b3258c9 (Add global hotness policy and tier manager)
         remote_backend = RemoteBackend(
             config,
             metadata,

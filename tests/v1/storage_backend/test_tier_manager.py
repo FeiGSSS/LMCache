@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
+import threading
 from types import SimpleNamespace
 
 # First Party
@@ -303,6 +304,63 @@ def test_run_once_between_low_and_high_only_runs_replace_promotion() -> None:
 
     assert hot_disk_key in cpu_backend.keys
     assert victim_cpu_key not in cpu_backend.keys
+
+
+def test_replace_promotion_waits_for_pressure_relief(monkeypatch) -> None:
+    hotness_policy = HotnessPolicy()
+    cpu_backend = FakeCPUBackend(capacity_bytes=100, usage_bytes=95)
+    disk_backend = FakeDiskBackend()
+    manager = _make_tier_manager(hotness_policy, cpu_backend, disk_backend)
+
+    victim_cpu_key = dumb_cache_engine_key(255)
+    cold_cpu_key = dumb_cache_engine_key(256)
+    hot_disk_key = dumb_cache_engine_key(257)
+    victim_obj = FakeMemoryObj()
+    cold_obj = FakeMemoryObj()
+    promoted_obj = FakeMemoryObj()
+    relief_entered = threading.Event()
+    allow_relief_exit = threading.Event()
+
+    hotness_policy.observe_store(victim_cpu_key, prefix_pos=20, now=0.0)
+    hotness_policy.observe_store(cold_cpu_key, prefix_pos=22, now=0.0)
+    hotness_policy.observe_store(hot_disk_key, prefix_pos=0, now=0.0)
+    hotness_policy.on_hit(hot_disk_key, now=0.0)
+    hotness_policy.on_hit(hot_disk_key, now=0.0)
+    hotness_policy.mark_resident(victim_cpu_key, Tier.CPU, True)
+    hotness_policy.mark_resident(victim_cpu_key, Tier.DISK, True)
+    hotness_policy.mark_resident(cold_cpu_key, Tier.CPU, True)
+    hotness_policy.mark_resident(cold_cpu_key, Tier.DISK, True)
+    hotness_policy.mark_resident(hot_disk_key, Tier.DISK, True)
+
+    cpu_backend.keys.update({victim_cpu_key, cold_cpu_key})
+    cpu_backend.objects[victim_cpu_key] = victim_obj
+    cpu_backend.objects[cold_cpu_key] = cold_obj
+    disk_backend.objects[victim_cpu_key] = victim_obj
+    disk_backend.objects[cold_cpu_key] = cold_obj
+    disk_backend.objects[hot_disk_key] = promoted_obj
+
+    def blocking_demote(key, blocking=True) -> bool:
+        _ = (key, blocking)
+        relief_entered.set()
+        allow_relief_exit.wait(timeout=1.0)
+        return False
+
+    monkeypatch.setattr(manager, "demote_key", blocking_demote)
+
+    relief_thread = threading.Thread(target=manager.ensure_cpu_headroom)
+    promotion_thread = threading.Thread(target=manager.maybe_replace_promote_disk)
+
+    relief_thread.start()
+    assert relief_entered.wait(timeout=1.0)
+
+    promotion_thread.start()
+    promotion_thread.join(timeout=0.1)
+    assert promotion_thread.is_alive()
+
+    allow_relief_exit.set()
+    relief_thread.join(timeout=1.0)
+    promotion_thread.join(timeout=1.0)
+    assert not promotion_thread.is_alive()
 
 
 def test_ensure_cpu_headroom_demotes_until_low_watermark() -> None:

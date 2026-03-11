@@ -297,6 +297,7 @@ class TestLocalCPUBackend:
         memory_obj = create_test_memory_obj()
 
         backend.submit_put_task(key, memory_obj)
+        memory_obj.ref_count_down()
         backend.run_policy_maintenance()
 
         assert backend.contains(key)
@@ -540,6 +541,7 @@ class TestLocalCPUBackend:
         key = create_test_key("fallback_key")
         cached_obj = create_test_memory_obj()
         backend.submit_put_task(key, cached_obj)
+        cached_obj.ref_count_down()
 
         calls = {"count": 0}
 
@@ -611,10 +613,11 @@ class TestLocalCPUBackend:
 
         local_cpu_backend.memory_allocator.close()
 
-    def test_submit_put_task_invokes_pressure_handler_after_crossing_watermark(self):
+    def test_submit_put_task_invokes_pressure_handler_after_crossing_watermark(
+        self, monkeypatch
+    ):
         """Test admit path triggers pressure handler once usage exceeds high watermark."""
         config = create_test_config()
-        config.max_local_cpu_size = 1e-6
         PinMonitor.GetOrCreate(config)
         allocator = FakePressureAllocator()
         backend = LocalCPUBackend(config=config, memory_allocator=allocator)
@@ -628,9 +631,16 @@ class TestLocalCPUBackend:
 
         try:
             backend.set_pressure_handler(handler, high_watermark=0.90)
+            monkeypatch.setattr(
+                backend,
+                "get_usage_bytes",
+                lambda: backend.get_capacity_bytes(),
+            )
             backend.submit_put_task(key, memory_obj)
             assert handler_calls == ["called"]
         finally:
+            if memory_obj.get_ref_count() > 1:
+                memory_obj.ref_count_down()
             backend.close()
             PinMonitor.DestroyInstance()
 
@@ -656,6 +666,51 @@ class TestLocalCPUBackend:
             backend.close()
             PinMonitor.DestroyInstance()
 
+    def test_get_capacity_bytes_matches_effective_allocator_capacity(
+        self, monkeypatch
+    ):
+        """Test get_capacity_bytes() reflects allocator sizing adjustments."""
+        config = create_test_config()
+        config.max_local_cpu_size = 8
+        config.reserve_local_cpu_size = 1
+        config.extra_config = {
+            "save_only_first_rank": True,
+            "first_rank_max_local_cpu_size": 6,
+        }
+        metadata = create_test_metadata()
+        metadata.use_mla = True
+
+        class DummyMixedMemoryAllocator:
+            def __init__(self, size, **kwargs):
+                self.size = size
+                self.kwargs = kwargs
+                self.align_bytes = kwargs.get("align_bytes", 4096)
+
+            def close(self):
+                return None
+
+        monkeypatch.setattr(
+            local_cpu_backend_module,
+            "MixedMemoryAllocator",
+            DummyMixedMemoryAllocator,
+        )
+        monkeypatch.setattr(
+            local_cpu_backend_module.SystemMemoryDetector,
+            "get_available_memory_gb",
+            staticmethod(lambda: 3.0),
+        )
+
+        PinMonitor.GetOrCreate(config)
+        backend = LocalCPUBackend(config=config, metadata=metadata, dst_device="cpu")
+
+        try:
+            expected_capacity = 2 * 1024**3
+            assert backend.get_capacity_bytes() == expected_capacity
+            assert backend.memory_allocator.size == expected_capacity
+        finally:
+            backend.close()
+            PinMonitor.DestroyInstance()
+
     def test_close_releases_allocator_and_clears_cache(self):
         """Test close() closes allocator and clears cached entries."""
         config = create_test_config()
@@ -665,6 +720,7 @@ class TestLocalCPUBackend:
         key = create_test_key("close_key")
         memory_obj = create_test_memory_obj()
         backend.submit_put_task(key, memory_obj)
+        memory_obj.ref_count_down()
 
         try:
             backend.close()
