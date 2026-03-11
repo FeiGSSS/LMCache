@@ -863,13 +863,13 @@ class NixlStaticStorageBackend(NixlStorageBackend):
     def batched_get_blocking(
         self,
         keys: List[CacheEngineKey],
-    ) -> List[Optional[MemoryObj]]:
+    ) -> List[MemoryObj]:
         """
         A blocking function to get the kv cache from the storage backend.
 
         :param List[CacheEngineKey] keys: The keys of the MemoryObjs.
 
-        :return: a list of memory objects.
+        :return: the longest hit prefix as a list of memory objects.
         """
 
         if not keys:
@@ -878,7 +878,15 @@ class NixlStaticStorageBackend(NixlStorageBackend):
         future = asyncio.run_coroutine_threadsafe(self.storage_to_mem(keys), self.loop)
 
         obj_list = future.result()
-        return obj_list
+        prefix_results: List[MemoryObj] = []
+        for memory_obj in obj_list:
+            if memory_obj is None:
+                break
+            prefix_results.append(memory_obj)
+        for memory_obj in obj_list[len(prefix_results) :]:
+            if memory_obj is not None:
+                memory_obj.ref_count_down()
+        return prefix_results
 
     async def batched_get_non_blocking(
         self,
@@ -1335,17 +1343,25 @@ class NixlDynamicStorageBackend(NixlStorageBackend):
     def batched_get_blocking(
         self,
         keys: List[CacheEngineKey],
-    ) -> List[Optional[MemoryObj]]:
+    ) -> List[MemoryObj]:
         """
         A blocking function to get the kv cache from the storage backend.
         :param List[CacheEngineKey] keys: The keys of the MemoryObjs.
-        :return: a list of memory objects.
+        :return: the longest hit prefix as a list of memory objects.
         """
         if not keys:
             return []
 
         obj_list = self.storage_to_mem(keys, False)
-        return obj_list
+        prefix_results: List[MemoryObj] = []
+        for memory_obj in obj_list:
+            if memory_obj is None:
+                break
+            prefix_results.append(memory_obj)
+        for memory_obj in obj_list[len(prefix_results) :]:
+            if memory_obj is not None:
+                memory_obj.ref_count_down()
+        return prefix_results
 
     async def batched_get_non_blocking(
         self,

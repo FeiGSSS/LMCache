@@ -177,17 +177,20 @@ class StorageBackendInterface(metaclass=abc.ABCMeta):
     def batched_get_blocking(
         self,
         keys: List[CacheEngineKey],
-    ) -> List[Optional[MemoryObj]]:
+    ) -> List[MemoryObj]:
         """
         A blocking function to get the kv cache from the storage backend.
 
         :param List[CacheEngineKey] keys: The keys of the MemoryObjs.
 
-        :return: a list of memory objects.
+        :return: the longest hit prefix as a list of memory objects.
         """
-        mem_objs = []
+        mem_objs: List[MemoryObj] = []
         for key in keys:
-            mem_objs.append(self.get_blocking(key))
+            memory_obj = self.get_blocking(key)
+            if memory_obj is None:
+                break
+            mem_objs.append(memory_obj)
         return mem_objs
 
     @abc.abstractmethod

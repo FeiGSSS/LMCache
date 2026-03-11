@@ -245,6 +245,7 @@ class StorageManager:
         self.lmcache_worker = lmcache_worker
         self.hotness_policy: Optional[HotnessPolicy] = None
         self.tier_manager: Optional[TierManager] = None
+        self.local_cpu_backend: Optional[LocalCPUBackend] = None
 
         # Use the unified create path so that init and
         # dynamic creation share the same logic.
@@ -412,6 +413,21 @@ class StorageManager:
                     self._record_hit(key)
 
         task.add_done_callback(_done)
+
+    def _write_back_to_local_cpu(
+        self,
+        keys: Sequence[CacheEngineKey],
+        memory_objs: List[MemoryObj],
+    ) -> None:
+        backend = self.local_cpu_backend
+        if backend is None:
+            return
+
+        backend.batched_submit_put_task(
+            keys,
+            memory_objs,
+            on_complete_callback=self._make_put_complete_callback("LocalCPUBackend"),
+        )
 
     def _make_internal_evict_callback(
         self,
@@ -646,41 +662,43 @@ class StorageManager:
         """
         Blocking function to get the memory objects from the storages.
         """
-        # TODO (ApostaC): remove the nested optional here
+        if not keys:
+            return []
+
+        stitched_results: List[Optional[MemoryObj]] = [None] * len(keys)
+        next_key_idx = 0
+
         for backend_name, storage_backend in self.get_active_storage_backends(location):
-            memory_objs = storage_backend.batched_get_blocking(keys)
-            if memory_objs:
-                for key, memory_obj in zip(keys, memory_objs, strict=False):
-                    if memory_obj is not None:
-                        self._record_hit(key)
-                # Align with single-key `get()` logic:
-                # auto-write remote data to local CPU cache
-                if (
-                    backend_name not in ["LocalCPUBackend", "PDBackend"]
-                    and "LocalCPUBackend" in self.storage_backends
-                    and None not in memory_objs
-                ):
-                    logger.debug(
-                        "Storing %s objects from %s to LocalCPUBackend",
-                        len(keys),
-                        backend_name,
-                    )
-                    local_cpu_backend = self.storage_backends["LocalCPUBackend"]
-                    assert isinstance(local_cpu_backend, LocalCPUBackend)
-                    # Type cast: Safe (we verified no Nones above)
-                    # `batched_submit_put_task` expects list[MemoryObj]
-                    # TODO (lisiG9): Refactor this write-back logic into caching
-                    #  policy module
-                    memory_objs_no_none = cast(List[MemoryObj], memory_objs)
-                    local_cpu_backend.batched_submit_put_task(
-                        keys,
-                        memory_objs_no_none,
-                        on_complete_callback=self._make_put_complete_callback(
-                            "LocalCPUBackend"
-                        ),
-                    )
-                return memory_objs
-        return [None] * len(keys)
+            if next_key_idx >= len(keys):
+                break
+
+            remaining_keys = keys[next_key_idx:]
+            memory_objs = storage_backend.batched_get_blocking(remaining_keys)
+            if not memory_objs:
+                continue
+
+            prefix_hits = len(memory_objs)
+            hit_keys = remaining_keys[:prefix_hits]
+            hit_memory_objs = memory_objs
+            for offset, (key, memory_obj) in enumerate(
+                zip(hit_keys, hit_memory_objs, strict=False)
+            ):
+                stitched_results[next_key_idx + offset] = memory_obj
+                self._record_hit(key)
+
+            # Align with single-key `get()` logic:
+            # auto-write non-CPU results back into local CPU cache.
+            if backend_name not in ["LocalCPUBackend", "PDBackend"]:
+                logger.debug(
+                    "Storing %s objects from %s to LocalCPUBackend",
+                    len(hit_keys),
+                    backend_name,
+                )
+                self._write_back_to_local_cpu(hit_keys, hit_memory_objs)
+
+            next_key_idx += prefix_hits
+
+        return stitched_results
 
     def layerwise_batched_get(
         self,

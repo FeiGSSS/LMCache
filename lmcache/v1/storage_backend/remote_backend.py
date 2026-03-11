@@ -373,18 +373,18 @@ class RemoteBackend(StorageBackendInterface):
     def batched_get_blocking(
         self,
         keys: List[CacheEngineKey],
-    ) -> List[Optional[MemoryObj]]:
+    ) -> List[MemoryObj]:
         # Check if local_cpu_backend is available (required for memory allocation)
         if self.local_cpu_backend is None:
             logger.warning(
                 "local_cpu_backend is None in batched_get_blocking "
-                "(likely scheduler role), returning None list"
+                "(likely scheduler role), returning empty prefix"
             )
-            return [None] * len(keys)
+            return []
 
         if self.connection is None:
-            logger.warning("Connection is None in batched_get_blocking, returning None")
-            return [None] * len(keys)
+            logger.warning("Connection is None in batched_get_blocking, returning []")
+            return []
 
         # For MLA worker id as 0 mode, use worker_id 0
         if self._mla_worker_id_as0_mode:
@@ -407,9 +407,9 @@ class RemoteBackend(StorageBackendInterface):
                 else:
                     logger.warning(
                         f"Error occurred in batched_get_blocking: {e}, "
-                        f"returning None list"
+                        f"returning empty prefix"
                     )
-                memory_objs = [None] * len(keys)
+                memory_objs = []
         else:
             remote_backend_individual_get_stats: dict[
                 CacheEngineKey, dict[str, float]
@@ -442,9 +442,10 @@ class RemoteBackend(StorageBackendInterface):
                                 f"Error occurred in get_blocking: {e}, returning None"
                             )
                         memory_obj = None
+                    if memory_obj is None:
+                        break
                     memory_objs.append(memory_obj)
                 else:
-                    memory_objs.append(None)
                     fut.cancel()
 
         t2 = time.perf_counter()
@@ -461,23 +462,13 @@ class RemoteBackend(StorageBackendInterface):
                 )
                 + duration
             )
-        decompressed_memory_objs: list[Optional[MemoryObj]] = []
-        error_happened = False
+        decompressed_memory_objs: list[MemoryObj] = []
         for memory_obj in memory_objs:
             if memory_obj is None:
-                error_happened = True
-                decompressed_memory_objs.append(None)
-            else:
-                decompressed_memory_objs.append(
-                    self.deserializer.deserialize(memory_obj)
-                )
-        if error_happened:
+                break
+            decompressed_memory_objs.append(self.deserializer.deserialize(memory_obj))
+        if len(decompressed_memory_objs) < len(keys):
             self._get_blocking_failed_count += 1
-
-        assert len(decompressed_memory_objs) == len(keys), (
-            f"keys length: {len(keys)}, "
-            f"decompressed memory objs length: {len(decompressed_memory_objs)}"
-        )
         return decompressed_memory_objs
 
     async def support_batched_async_contains(self) -> bool:

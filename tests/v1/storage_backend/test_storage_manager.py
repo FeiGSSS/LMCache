@@ -537,6 +537,106 @@ def test_prefetch_callback_with_keyed_results_updates_hotness(storage_manager):
     assert state2.hit_count == 1
 
 
+def test_batched_get_stitches_prefix_hits_across_backends(storage_manager):
+    class FakeCPUBackend:
+        def __init__(self, keys, objs):
+            self.keys = keys
+            self.objs = objs
+            self.calls = []
+
+        def batched_get_blocking(self, query_keys):
+            self.calls.append(list(query_keys))
+            for key in query_keys:
+                idx = self.keys.index(key)
+                if idx >= 5:
+                    return [self.objs[self.keys.index(hit_key)] for hit_key in query_keys[:idx]]
+            return [self.objs[self.keys.index(key)] for key in query_keys]
+
+    class FakeDiskBackend:
+        def __init__(self, keys, objs):
+            self.keys = keys
+            self.objs = objs
+            self.calls = []
+
+        def batched_get_blocking(self, query_keys):
+            self.calls.append(list(query_keys))
+            return [self.objs[self.keys.index(key)] for key in query_keys]
+
+    keys = [dumb_cache_engine_key(840 + i) for i in range(10)]
+    objs = [MockMemoryObj(i) for i in range(10)]
+    cpu_backend = FakeCPUBackend(keys, objs)
+    disk_backend = FakeDiskBackend(keys, objs)
+    storage_manager.hotness_policy = HotnessPolicy()
+    storage_manager.storage_backends = OrderedDict(
+        [
+            ("LocalCPUBackend", cpu_backend),
+            ("LocalDiskBackend", disk_backend),
+        ]
+    )
+
+    results = storage_manager.batched_get(keys)
+
+    assert results == objs
+    assert cpu_backend.calls == [keys]
+    assert disk_backend.calls == [keys[5:]]
+    for key in keys:
+        state = storage_manager.hotness_policy.get_state(key)
+        assert state is not None
+        assert state.hit_count == 1
+
+
+def test_batched_get_writes_back_only_non_cpu_suffix(storage_manager):
+    class FakeCPUBackend:
+        def batched_get_blocking(self, query_keys):
+            _ = query_keys
+            return []
+
+    class FakeDiskBackend:
+        def __init__(self, keys, objs):
+            self.keys = keys
+            self.objs = objs
+
+        def batched_get_blocking(self, query_keys):
+            return [self.objs[self.keys.index(key)] for key in query_keys]
+
+    class FakeWriteBackCPU:
+        def __init__(self):
+            self.calls = []
+
+        def batched_submit_put_task(
+            self,
+            keys,
+            memory_objs,
+            transfer_spec=None,
+            on_complete_callback=None,
+        ):
+            _ = transfer_spec
+            self.calls.append((list(keys), list(memory_objs)))
+            if on_complete_callback is not None:
+                for key in keys:
+                    on_complete_callback(key)
+
+    keys = [dumb_cache_engine_key(860 + i) for i in range(4)]
+    objs = [MockMemoryObj(i) for i in range(4)]
+    storage_manager.hotness_policy = HotnessPolicy()
+    storage_manager.storage_backends = OrderedDict(
+        [
+            ("LocalCPUBackend", FakeCPUBackend()),
+            ("LocalDiskBackend", FakeDiskBackend(keys, objs)),
+        ]
+    )
+    storage_manager.local_cpu_backend = FakeWriteBackCPU()
+
+    results = storage_manager.batched_get(keys)
+
+    assert results == objs
+    assert storage_manager.local_cpu_backend.calls == [(keys, objs)]
+    for key in keys:
+        state = storage_manager.hotness_policy.get_state(key)
+        assert state is not None
+        assert Tier.CPU in state.resident_tiers
+
+
 def test_clear_updates_hotness_tiers_without_reconcile(storage_manager):
     class FakeBackend:
         def __init__(self) -> None:
