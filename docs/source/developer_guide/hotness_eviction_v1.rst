@@ -33,7 +33,6 @@ The scope is intentionally narrow:
 
 This phase does not include:
 
-* active ``CPU -> Disk`` copying for CPU-only keys before eviction
 * remote-tier scheduling
 * user-facing configuration for weights, watermarks, or refresh intervals
 
@@ -51,6 +50,12 @@ Backend-local policies remain in each backend, but when
 ``cache_policy=\"HOTNESS\"`` is configured they fall back to ``LRU`` internally.
 That preserves existing backend behavior for emergency local eviction while the
 global hotness path becomes the primary cross-tier decision mechanism.
+
+The repository still contains the older backend-local
+``cache_policy/hotness.py`` implementation and its unit tests. That code is now
+best understood as a standalone policy primitive and compatibility artifact. It
+is not the primary CPU/Disk hotness implementation used when
+``cache_policy=\"HOTNESS\"`` is enabled in V1.
 
 Hotness State
 -------------
@@ -135,8 +140,13 @@ Tier Management
 
 ``TierManager`` runs in the background and uses the global hotness state:
 
-* if CPU usage exceeds the high watermark, it selects the coldest CPU keys that
-  already exist on disk and proactively evicts them from CPU
+* if CPU usage exceeds the high watermark, it selects the coldest CPU keys and
+  proactively demotes them
+* if a cold CPU key already exists on disk, the demotion completes immediately
+  by removing the CPU copy
+* if a cold CPU key exists only on CPU, ``TierManager`` first submits an async
+  disk write and removes the CPU copy only after the disk write completion
+  callback succeeds
 * if CPU usage is below the high watermark, it compares the hottest disk-only
   keys with the coldest CPU keys and promotes disk keys whose score exceeds the
   CPU floor by a promotion margin
@@ -178,7 +188,6 @@ Future Work
 
 Likely follow-up work:
 
-* active ``CPU -> Disk`` demotion for CPU-only keys
 * explicit admission control for disk
 * remote-tier integration
 * configurable scoring weights and watermark thresholds
