@@ -35,6 +35,10 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+def _resolve_backend_policy_name(policy_name: str) -> str:
+    return "LRU" if policy_name.upper() == "HOTNESS" else policy_name
+
+
 class LocalCPUBackend(AllocatorBackendInterface):
     """
     Even if local_cpu is False (the hot_cache is not used), contains(),
@@ -55,7 +59,9 @@ class LocalCPUBackend(AllocatorBackendInterface):
         else:
             super().__init__("cpu")
 
-        self.cache_policy = get_cache_policy(config.cache_policy)
+        self.cache_policy = get_cache_policy(
+            _resolve_backend_policy_name(config.cache_policy)
+        )
         self.hot_cache = self.cache_policy.init_mutable_mapping()
 
         self.use_hot = config.local_cpu
@@ -132,6 +138,15 @@ class LocalCPUBackend(AllocatorBackendInterface):
                 self.cache_policy.update_on_hit(key, self.hot_cache)
             self.keys_in_request = []
 
+    def run_policy_maintenance(self) -> None:
+        """Run periodic maintenance for the configured cache policy."""
+        with self.cpu_lock:
+            self.cache_policy.periodic_maintenance(self.hot_cache)
+
+    def requires_policy_maintenance(self) -> bool:
+        """Report whether the configured policy needs background maintenance."""
+        return self.cache_policy.requires_periodic_maintenance()
+
     def exists_in_put_tasks(self, key: CacheEngineKey) -> bool:
         """
         contains() and exists_in_put_tasks() should be checked together
@@ -142,11 +157,13 @@ class LocalCPUBackend(AllocatorBackendInterface):
         self,
         key: CacheEngineKey,
         memory_obj: MemoryObj,
+        prefix_pos: int = 0,
         on_complete_callback: Optional[Callable[[CacheEngineKey], None]] = None,
     ) -> Optional[Future]:
         """
         Synchronously put the MemoryObj into the local cpu backend.
 
+        :param prefix_pos: The chunk position within the current batched put.
         :param on_complete_callback: Optional callback invoked after the
             synchronous put completes. Callback exceptions are caught and logged.
         """
@@ -158,6 +175,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
             memory_obj.ref_count_up()
             self.hot_cache[key] = memory_obj
 
+            self.cache_policy.record_context(key, prefix_pos=prefix_pos)
             self.cache_policy.update_on_put(key)
 
             # Push kv admit msg with batching
@@ -194,9 +212,14 @@ class LocalCPUBackend(AllocatorBackendInterface):
             return
 
         # TODO(Jiayi): optimize this with batching
-        for key, memory_obj in zip(keys, memory_objs, strict=False):
+        for prefix_pos, (key, memory_obj) in enumerate(
+            zip(keys, memory_objs, strict=False)
+        ):
             self.submit_put_task(
-                key, memory_obj, on_complete_callback=on_complete_callback
+                key,
+                memory_obj,
+                prefix_pos=prefix_pos,
+                on_complete_callback=on_complete_callback,
             )
 
     def get_blocking(
@@ -774,6 +797,27 @@ class LocalCPUBackend(AllocatorBackendInterface):
         """
         with self.cpu_lock:
             return list(self.hot_cache.keys())
+
+    def list_resident_keys(self) -> List[CacheEngineKey]:
+        """
+        Return a snapshot of resident CPU keys.
+        """
+        return self.get_keys()
+
+    def get_usage_bytes(self) -> int:
+        """
+        Estimate current CPU hot-cache usage in bytes.
+        """
+        with self.cpu_lock:
+            return sum(
+                memory_obj.get_physical_size() for memory_obj in self.hot_cache.values()
+            )
+
+    def get_capacity_bytes(self) -> int:
+        """
+        Return the configured CPU hot-cache capacity in bytes.
+        """
+        return int(self.config.max_local_cpu_size * 1024**3)
 
     def clear(self) -> int:
         """

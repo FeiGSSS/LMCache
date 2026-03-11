@@ -5,6 +5,7 @@ from concurrent.futures import Future
 from typing import (
     TYPE_CHECKING,
     Any,
+    Callable,
     Coroutine,
     Dict,
     Generator,
@@ -18,6 +19,7 @@ from typing import (
 import asyncio
 import functools
 import threading
+from time import time
 
 # Third Party
 import torch
@@ -42,7 +44,9 @@ from lmcache.v1.storage_backend.abstract_backend import (
     AllocatorBackendInterface,
     StorageBackendInterface,
 )
+from lmcache.v1.storage_backend.hotness_policy import HotnessPolicy, Tier
 from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
+from lmcache.v1.storage_backend.tier_manager import TierManager
 
 if TYPE_CHECKING:
     # First Party
@@ -52,7 +56,6 @@ if TYPE_CHECKING:
     )
 
 logger = init_logger(__name__)
-
 
 # Helper function to get the class name of the backend
 def get_backend_cname(backend: StorageBackendInterface):
@@ -239,6 +242,8 @@ class StorageManager:
         self.storage_backends: OrderedDict[str, StorageBackendInterface] = OrderedDict()
         self.manager_lock = threading.Lock()
         self.lmcache_worker = lmcache_worker
+        self.hotness_policy: Optional[HotnessPolicy] = None
+        self.tier_manager: Optional[TierManager] = None
 
         # Use the unified create path so that init and
         # dynamic creation share the same logic.
@@ -283,6 +288,11 @@ class StorageManager:
             assert self.allocator_backend is not None
             self.async_serializer = AsyncSingleSerializer(self.loop)
 
+        if self._is_hotness_enabled():
+            self.hotness_policy = HotnessPolicy()
+            self._reconcile_hotness_residency()
+            self.tier_manager = TierManager(self, self.hotness_policy)
+            self.tier_manager.start()
         self._setup_metrics()
 
     def _setup_metrics(self):
@@ -317,6 +327,79 @@ class StorageManager:
             allocator_backend = self.storage_backends["LocalCPUBackend"]
         assert isinstance(allocator_backend, AllocatorBackendInterface)
         return allocator_backend
+
+    def _backend_name_to_tier(self, backend_name: str) -> Optional[Tier]:
+        if backend_name == "LocalCPUBackend":
+            return Tier.CPU
+        if backend_name == "LocalDiskBackend":
+            return Tier.DISK
+        if backend_name == "RemoteBackend":
+            return Tier.REMOTE
+        return None
+
+    def _record_store_observations(self, keys: Sequence[CacheEngineKey]) -> None:
+        if self.hotness_policy is None:
+            return
+        now = time()
+        for prefix_pos, key in enumerate(keys):
+            self.hotness_policy.observe_store(key, prefix_pos, now=now)
+
+    def _mark_resident(
+        self,
+        key: CacheEngineKey,
+        tier: Optional[Tier],
+        present: bool,
+    ) -> None:
+        if self.hotness_policy is None or tier is None:
+            return
+        self.hotness_policy.mark_resident(key, tier, present)
+
+    def _make_put_complete_callback(
+        self,
+        backend_name: str,
+    ) -> Optional[Callable[[CacheEngineKey], None]]:
+        tier = self._backend_name_to_tier(backend_name)
+        if tier is None or self.hotness_policy is None:
+            return None
+
+        def _callback(key: CacheEngineKey) -> None:
+            self._mark_resident(key, tier, True)
+
+        return _callback
+
+    def _record_hit(self, key: CacheEngineKey) -> None:
+        if self.hotness_policy is None:
+            return
+        self.hotness_policy.on_hit(key)
+
+    def _reconcile_hotness_residency(self) -> None:
+        if self.hotness_policy is None:
+            return
+
+        self.hotness_policy.clear_tier(Tier.CPU)
+        self.hotness_policy.clear_tier(Tier.DISK)
+        self.hotness_policy.clear_tier(Tier.REMOTE)
+
+        for backend_name, backend in self.storage_backends.items():
+            tier = self._backend_name_to_tier(backend_name)
+            if tier is None or not hasattr(backend, "list_resident_keys"):
+                continue
+            for key in backend.list_resident_keys():
+                self.hotness_policy.mark_resident(key, tier, True)
+
+    def _is_hotness_enabled(self) -> bool:
+        return self.config.cache_policy.upper() == "HOTNESS"
+
+    def is_tier_manager_running(self) -> bool:
+        if self.tier_manager is None:
+            return False
+        return self.tier_manager.is_running()
+
+    def is_policy_aging_running(self) -> bool:
+        """
+        Backward-compatible alias for the tier-manager background loop.
+        """
+        return self.is_tier_manager_running()
 
     @_lmcache_nvtx_annotate
     def allocate(
@@ -400,6 +483,7 @@ class StorageManager:
             keys,
             memory_objs,
         )
+        self._record_store_observations(keys)
 
         for backend_name, backend in self.storage_backends.items():
             if location and backend_name != location:
@@ -420,7 +504,12 @@ class StorageManager:
             # NOTE: the handling of exists_in_put_tasks
             # is done in the backend
             ks, objs = obj_dict[cname]
-            backend.batched_submit_put_task(ks, objs, transfer_spec=transfer_spec)
+            backend.batched_submit_put_task(
+                ks,
+                objs,
+                transfer_spec=transfer_spec,
+                on_complete_callback=self._make_put_complete_callback(backend_name),
+            )
 
         for cname, (ks, objs) in obj_dict.items():
             for memory_obj in objs:
@@ -441,13 +530,20 @@ class StorageManager:
             # are allocated by the allocator backend.
             memory_obj = backend.get_blocking(key)
             if memory_obj:
+                self._record_hit(key)
                 if (
                     backend_name not in ["LocalCPUBackend", "PDBackend"]
                     and "LocalCPUBackend" in self.storage_backends
                 ):
                     local_cpu_backend = self.storage_backends["LocalCPUBackend"]
                     assert isinstance(local_cpu_backend, LocalCPUBackend)
-                    local_cpu_backend.submit_put_task(key, memory_obj)
+                    local_cpu_backend.submit_put_task(
+                        key,
+                        memory_obj,
+                        on_complete_callback=self._make_put_complete_callback(
+                            "LocalCPUBackend"
+                        ),
+                    )
                 return memory_obj
 
         return None
@@ -483,6 +579,9 @@ class StorageManager:
         for backend_name, storage_backend in self.get_active_storage_backends(location):
             memory_objs = storage_backend.batched_get_blocking(keys)
             if memory_objs:
+                for key, memory_obj in zip(keys, memory_objs, strict=False):
+                    if memory_obj is not None:
+                        self._record_hit(key)
                 # Align with single-key `get()` logic:
                 # auto-write remote data to local CPU cache
                 if (
@@ -502,7 +601,13 @@ class StorageManager:
                     # TODO (lisiG9): Refactor this write-back logic into caching
                     #  policy module
                     memory_objs_no_none = cast(List[MemoryObj], memory_objs)
-                    local_cpu_backend.batched_submit_put_task(keys, memory_objs_no_none)
+                    local_cpu_backend.batched_submit_put_task(
+                        keys,
+                        memory_objs_no_none,
+                        on_complete_callback=self._make_put_complete_callback(
+                            "LocalCPUBackend"
+                        ),
+                    )
                 return memory_objs
         return [None] * len(keys)
 
@@ -1005,7 +1110,12 @@ class StorageManager:
         for backend_name, backend in self.storage_backends.items():
             # TODO(Jiayi): need to handle remove in non-cpu backends
             if locations is None or backend_name in locations:
-                num_removed += backend.remove(key)
+                removed = backend.remove(key)
+                num_removed += removed
+                if removed:
+                    self._mark_resident(
+                        key, self._backend_name_to_tier(backend_name), False
+                    )
 
         return num_removed
 
@@ -1031,7 +1141,15 @@ class StorageManager:
         num_removed = 0
         for backend_name, backend in self.storage_backends.items():
             if locations is None or backend_name in locations:
-                num_removed += backend.batched_remove(keys)
+                tier = self._backend_name_to_tier(backend_name)
+                if self.hotness_policy is not None and tier is not None:
+                    for key in keys:
+                        removed = backend.remove(key)
+                        num_removed += removed
+                        if removed:
+                            self._mark_resident(key, tier, False)
+                else:
+                    num_removed += backend.batched_remove(keys)
 
         return num_removed
 
@@ -1083,6 +1201,8 @@ class StorageManager:
                         "clear operation. Skipping."
                     )
 
+        if self.hotness_policy is not None:
+            self._reconcile_hotness_residency()
         return num_cleared_tokens
 
     def memcheck(self) -> bool:
@@ -1174,6 +1294,7 @@ class StorageManager:
             True if the backend was found and closed, False
             otherwise.
         """
+        refresh_thread_state = False
         with self.manager_lock:
             backend = self.storage_backends.get(backend_name)
             if backend is None:
@@ -1195,8 +1316,11 @@ class StorageManager:
             self.non_allocator_backends = self.get_non_allocator_backends()
             if backend_name == "LocalCPUBackend":
                 self.local_cpu_backend = None
+            refresh_thread_state = True
             logger.info("Backend %s closed and removed", backend_name)
-            return True
+        if refresh_thread_state and self.hotness_policy is not None:
+            self._reconcile_hotness_residency()
+        return True
 
     def create_backends(self) -> Dict[str, str]:
         """
@@ -1241,7 +1365,9 @@ class StorageManager:
             if cpu is not None:
                 self.local_cpu_backend = cpu
 
-            return created
+        if self.hotness_policy is not None:
+            self._reconcile_hotness_residency()
+        return created
 
     def recreate_backend(self, backend_name: str) -> Dict[str, str]:
         """
@@ -1305,10 +1431,15 @@ class StorageManager:
             elif backend_name == "LocalCPUBackend":
                 self.local_cpu_backend = None
 
-            return created
+        if self.hotness_policy is not None:
+            self._reconcile_hotness_residency()
+        return created
 
     def close(self):
         logger.info("Closing StorageManager...")
+
+        if self.tier_manager is not None:
+            self.tier_manager.stop()
 
         # Close all backends
         for name, backend in self.storage_backends.items():

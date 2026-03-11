@@ -33,6 +33,10 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+def _resolve_backend_policy_name(policy_name: str) -> str:
+    return "LRU" if policy_name.upper() == "HOTNESS" else policy_name
+
+
 # TODO(Jiayi): handle cases where cache is repetitvely prefetched.
 class LocalDiskWorker:
     def __init__(self, loop: asyncio.AbstractEventLoop) -> None:
@@ -109,7 +113,9 @@ class LocalDiskBackend(StorageBackendInterface):
         else:
             super().__init__("cpu")
 
-        self.cache_policy = get_cache_policy(config.cache_policy)
+        self.cache_policy = get_cache_policy(
+            _resolve_backend_policy_name(config.cache_policy)
+        )
         self.dict = self.cache_policy.init_mutable_mapping()
 
         self.dst_device = dst_device
@@ -193,6 +199,15 @@ class LocalDiskBackend(StorageBackendInterface):
             for key in reversed(self.keys_in_request):
                 self.cache_policy.update_on_hit(key, self.dict)
             self.keys_in_request = []
+
+    def run_policy_maintenance(self) -> None:
+        """Run periodic maintenance for the configured cache policy."""
+        with self.disk_lock:
+            self.cache_policy.periodic_maintenance(self.dict)
+
+    def requires_policy_maintenance(self) -> bool:
+        """Report whether the configured policy needs background maintenance."""
+        return self.cache_policy.requires_periodic_maintenance()
 
     def exists_in_put_tasks(self, key: CacheEngineKey) -> bool:
         return self.disk_worker.exists_in_put_tasks(key)
@@ -280,6 +295,7 @@ class LocalDiskBackend(StorageBackendInterface):
                 self.dict[key] = DiskCacheMetadata(
                     path, size, shape, dtype, cached_positions, fmt, 0
                 )
+                self.cache_policy.update_on_put(key)
 
         # Push kv admit msg with batching
         if self.batched_msg_sender is not None and not has_stored:
@@ -292,13 +308,15 @@ class LocalDiskBackend(StorageBackendInterface):
         self,
         key: CacheEngineKey,
         memory_obj: MemoryObj,
+        prefix_pos: int = 0,
         on_complete_callback: Optional[Callable[[CacheEngineKey], None]] = None,
-    ):
+    ) -> Optional[Future]:
         """
         Submit a single put task to store KV cache to disk asynchronously.
 
         :param key: The cache key for this KV chunk.
         :param memory_obj: The memory object containing the KV data.
+        :param prefix_pos: The chunk position within the current batched put.
         :param on_complete_callback: Optional callback invoked once per key
             after the disk write completes. Callback exceptions are caught
             and logged.
@@ -340,10 +358,10 @@ class LocalDiskBackend(StorageBackendInterface):
         if not evict_success:
             return None
 
-        self.cache_policy.update_on_put(key)
+        self.cache_policy.record_context(key, prefix_pos=prefix_pos)
         memory_obj.ref_count_up()
 
-        asyncio.run_coroutine_threadsafe(
+        return asyncio.run_coroutine_threadsafe(
             self.disk_worker.submit_task(
                 "put",
                 self.async_save_bytes_to_disk,
@@ -372,9 +390,14 @@ class LocalDiskBackend(StorageBackendInterface):
             after that key's disk write completes (not once per batch).
             Callback exceptions are caught and logged.
         """
-        for key, memory_obj in zip(keys, memory_objs, strict=False):
+        for prefix_pos, (key, memory_obj) in enumerate(
+            zip(keys, memory_objs, strict=False)
+        ):
             self.submit_put_task(
-                key, memory_obj, on_complete_callback=on_complete_callback
+                key,
+                memory_obj,
+                prefix_pos=prefix_pos,
+                on_complete_callback=on_complete_callback,
             )
 
     def get_blocking(
@@ -628,6 +651,25 @@ class LocalDiskBackend(StorageBackendInterface):
 
     def get_allocator_backend(self):
         return self.local_cpu_backend
+
+    def list_resident_keys(self) -> List[CacheEngineKey]:
+        """
+        Return a snapshot of resident disk keys.
+        """
+        with self.disk_lock:
+            return list(self.dict.keys())
+
+    def get_usage_bytes(self) -> int:
+        """
+        Return current disk-cache usage in bytes.
+        """
+        return int(self.current_cache_size)
+
+    def get_capacity_bytes(self) -> int:
+        """
+        Return configured disk-cache capacity in bytes.
+        """
+        return self.max_cache_size
 
     def close(self) -> None:
         if self.batched_msg_sender is not None:

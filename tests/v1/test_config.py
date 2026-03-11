@@ -114,6 +114,11 @@ def test_update_config_from_env_error_handling():
     del os.environ["LMCACHE_CONTROLLER_PULL_URL"]
 
 
+def test_hotness_cache_policy_config():
+    config = LMCacheEngineConfig.from_defaults(cache_policy="HOTNESS")
+    assert config.cache_policy == "HOTNESS"
+
+
 @pytest.mark.parametrize("use_mla", [True, False])
 def test_get_lookup_server_worker_ids(use_mla):
     config = LMCacheEngineConfig.from_defaults()

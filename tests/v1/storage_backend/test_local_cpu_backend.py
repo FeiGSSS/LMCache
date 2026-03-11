@@ -42,7 +42,10 @@ class MockLMCacheWorker:
 
 
 def create_test_config(
-    local_cpu: bool = True, use_layerwise: bool = False, enable_blending: bool = False
+    local_cpu: bool = True,
+    use_layerwise: bool = False,
+    enable_blending: bool = False,
+    cache_policy: str = "LRU",
 ):
     """Create a test configuration for LocalCPUBackend."""
     config = LMCacheEngineConfig.from_defaults(
@@ -50,6 +53,7 @@ def create_test_config(
         local_cpu=local_cpu,
         use_layerwise=use_layerwise,
         enable_blending=enable_blending,
+        cache_policy=cache_policy,
         lmcache_instance_id="test_instance",
     )
     return config
@@ -253,6 +257,32 @@ class TestLocalCPUBackend:
         assert futures is None
 
         local_cpu_backend_disabled.memory_allocator.close()
+
+    def test_hotness_uses_lru_fallback_policy(self, memory_allocator):
+        """Test HOTNESS config uses backend-local fallback policy."""
+        config = create_test_config(cache_policy="HOTNESS")
+        backend = LocalCPUBackend(config=config, memory_allocator=memory_allocator)
+        assert backend.cache_policy.__class__.__name__ == "LRUCachePolicy"
+
+        backend.memory_allocator.close()
+
+    def test_run_policy_maintenance_hotness_fallback(self, memory_allocator):
+        """Test maintenance hook stays harmless with HOTNESS fallback."""
+        config = create_test_config(cache_policy="HOTNESS")
+        backend = LocalCPUBackend(config=config, memory_allocator=memory_allocator)
+        key = create_test_key("maintenance_key")
+        memory_obj = create_test_memory_obj()
+
+        backend.submit_put_task(key, memory_obj)
+        backend.run_policy_maintenance()
+
+        assert backend.contains(key)
+        evict_candidates = backend.cache_policy.get_evict_candidates(
+            backend.hot_cache, num_candidates=1
+        )
+        assert evict_candidates == [key]
+
+        backend.memory_allocator.close()
 
     def test_get_blocking_key_not_exists(self, local_cpu_backend):
         """Test get_blocking() when key doesn't exist."""

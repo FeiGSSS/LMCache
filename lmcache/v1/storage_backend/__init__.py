@@ -13,15 +13,11 @@ from lmcache.logging import init_logger
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.storage_backend.abstract_backend import StorageBackendInterface
-from lmcache.v1.storage_backend.gds_backend import GdsBackend
-from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
-from lmcache.v1.storage_backend.local_disk_backend import LocalDiskBackend
-from lmcache.v1.storage_backend.p2p_backend import P2PBackend
-from lmcache.v1.storage_backend.remote_backend import RemoteBackend
 
 if TYPE_CHECKING:
     # First Party
     from lmcache.v1.cache_controller.worker import LMCacheWorker
+    from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
 
 logger = init_logger(__name__)
 
@@ -43,7 +39,7 @@ def storage_plugin_launcher(
     config: LMCacheEngineConfig,
     metadata: LMCacheMetadata,
     loop: asyncio.AbstractEventLoop,
-    local_cpu_backend: Optional[LocalCPUBackend],
+    local_cpu_backend: Optional["LocalCPUBackend"],
     dst_device: str,
     storage_backends: OrderedDict[str, StorageBackendInterface],
 ) -> None:
@@ -119,6 +115,10 @@ def CreateStorageBackends(
     skip_backends: Optional[AbstractSet[str]] = None,
     existing_backends: Optional[OrderedDict[str, StorageBackendInterface]] = None,
 ) -> OrderedDict[str, StorageBackendInterface]:
+    # First Party
+    from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
+    from lmcache.v1.storage_backend.local_disk_backend import LocalDiskBackend
+
     if is_cuda_worker(metadata):
         dst_device = f"cuda:{torch.cuda.current_device()}"
     elif dst_device == "xpu":
@@ -144,7 +144,7 @@ def CreateStorageBackends(
     # other backends might need it as a buffer.
     # Reuse existing LocalCPUBackend when available so that
     # dependent backends (disk, remote, p2p, …) keep working.
-    local_cpu_backend: Optional[LocalCPUBackend] = None
+    local_cpu_backend: Optional["LocalCPUBackend"] = None
     if existing_backends and "LocalCPUBackend" in existing_backends:
         _existing_cpu = existing_backends["LocalCPUBackend"]
         if isinstance(_existing_cpu, LocalCPUBackend):
@@ -169,6 +169,9 @@ def CreateStorageBackends(
             logger.info("No cpu memory is allocated as max_local_cpu_size <= 0")
 
     if config.enable_p2p and "P2PBackend" not in _skip:
+        # First Party
+        from lmcache.v1.storage_backend.p2p_backend import P2PBackend
+
         assert local_cpu_backend is not None
         assert lmcache_worker is not None
         p2p_backend = P2PBackend(
@@ -210,6 +213,9 @@ def CreateStorageBackends(
         storage_backends[backend_name] = local_disk_backend
 
     if config.gds_path is not None and "GdsBackend" not in _skip:
+        # First Party
+        from lmcache.v1.storage_backend.gds_backend import GdsBackend
+
         gds_backend = GdsBackend(
             config,
             metadata,
@@ -219,10 +225,16 @@ def CreateStorageBackends(
         storage_backends[str(gds_backend)] = gds_backend
 
     if config.remote_url is not None and "RemoteBackend" not in _skip:
+<<<<<<< HEAD
         assert local_cpu_backend is not None, (
             "Remote backend requires local CPU backend as a buffer."
             "Please turn on local cpu backend with max_local_cpu_size > 0"
         )
+=======
+        # First Party
+        from lmcache.v1.storage_backend.remote_backend import RemoteBackend
+
+>>>>>>> b3258c9 (Add global hotness policy and tier manager)
         remote_backend = RemoteBackend(
             config,
             metadata,
@@ -266,3 +278,17 @@ def CreateStorageBackends(
     else:
         # If audit is not enabled, use the original backends
         return storage_backends
+
+
+def __getattr__(name: str):
+    if name == "LocalCPUBackend":
+        # First Party
+        from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
+
+        return LocalCPUBackend
+    if name == "LocalDiskBackend":
+        # First Party
+        from lmcache.v1.storage_backend.local_disk_backend import LocalDiskBackend
+
+        return LocalDiskBackend
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

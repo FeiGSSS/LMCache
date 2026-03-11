@@ -21,6 +21,7 @@ Key scenarios tested:
 
 # Standard
 import asyncio
+import time
 
 # Third Party
 import pytest
@@ -30,6 +31,7 @@ import torch
 from lmcache.v1.config import LMCacheEngineConfig
 from lmcache.v1.event_manager import EventManager, EventType
 from lmcache.v1.metadata import LMCacheMetadata
+from lmcache.v1.storage_backend import tier_manager as tier_manager_module
 from lmcache.v1.storage_backend.storage_manager import StorageManager
 
 
@@ -317,3 +319,85 @@ class TestStorageManagerPrefetchCallback:
         # (no remaining chunks in current tier, no subsequent tiers)
         for obj in tier0_objs:
             assert not obj.ref_count_down_called
+
+
+def test_hotness_tier_manager_thread_runs(event_manager, monkeypatch):
+    monkeypatch.setattr(
+        tier_manager_module,
+        "DEFAULT_TIER_MANAGER_INTERVAL_SECS",
+        0.01,
+    )
+    config = LMCacheEngineConfig.from_defaults(
+        chunk_size=256,
+        local_cpu=True,
+        max_local_cpu_size=0.01,
+        cache_policy="HOTNESS",
+        lmcache_instance_id="test_instance",
+    )
+    metadata = LMCacheMetadata(
+        model_name="test_model",
+        world_size=1,
+        local_world_size=1,
+        worker_id=0,
+        local_worker_id=0,
+        kv_dtype=torch.bfloat16,
+        kv_shape=(28, 2, 256, 8, 128),
+        role="worker",
+    )
+    manager = StorageManager(
+        config=config,
+        metadata=metadata,
+        event_manager=event_manager,
+    )
+
+    assert manager.is_tier_manager_running()
+
+    calls = {"count": 0}
+    tier_manager = manager.tier_manager
+    assert tier_manager is not None
+    original = tier_manager.run_once
+
+    def wrapped_run_once():
+        calls["count"] += 1
+        original()
+
+    tier_manager.run_once = wrapped_run_once
+
+    deadline = time.time() + 0.5
+    while time.time() < deadline and calls["count"] == 0:
+        time.sleep(0.02)
+
+    manager.close()
+
+    assert calls["count"] > 0
+    assert not manager.is_tier_manager_running()
+
+
+def test_non_hotness_policy_does_not_start_aging_thread(event_manager):
+    config = LMCacheEngineConfig.from_defaults(
+        chunk_size=256,
+        local_cpu=True,
+        max_local_cpu_size=0.01,
+        cache_policy="LRU",
+        lmcache_instance_id="test_instance",
+    )
+    metadata = LMCacheMetadata(
+        model_name="test_model",
+        world_size=1,
+        local_world_size=1,
+        worker_id=0,
+        local_worker_id=0,
+        kv_dtype=torch.bfloat16,
+        kv_shape=(28, 2, 256, 8, 128),
+        role="worker",
+    )
+    manager = StorageManager(
+        config=config,
+        metadata=metadata,
+        event_manager=event_manager,
+    )
+
+    try:
+        assert not manager.is_tier_manager_running()
+    finally:
+        manager.close()

@@ -162,6 +162,7 @@ Documentation
    developer_guide/docker_file
    developer_guide/architecture
    developer_guide/integration
+   developer_guide/hotness_eviction_v1
    developer_guide/extending_lmcache/index
    developer_guide/usage/index
 
