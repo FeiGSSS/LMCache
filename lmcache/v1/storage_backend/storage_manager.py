@@ -326,11 +326,6 @@ class StorageManager:
         assert isinstance(allocator_backend, AllocatorBackendInterface)
         return allocator_backend
 
-    def _record_store_observations(self, keys: Sequence[CacheEngineKey]) -> None:
-        if self.tier_manager is None:
-            return
-        self.tier_manager.observe_store(keys)
-
     def _record_hit(self, key: CacheEngineKey) -> None:
         if self.tier_manager is None:
             return
@@ -375,27 +370,7 @@ class StorageManager:
 
         task.add_done_callback(_done)
 
-    def _write_back_to_local_cpu(
-        self,
-        keys: Sequence[CacheEngineKey],
-        memory_objs: List[MemoryObj],
-    ) -> None:
-        backend = self.local_cpu_backend
-        if backend is None:
-            return
-
-        callback = (
-            self.tier_manager.make_put_complete_callback("LocalCPUBackend")
-            if self.tier_manager is not None
-            else None
-        )
-        backend.batched_submit_put_task(
-            keys,
-            memory_objs,
-            on_complete_callback=callback,
-        )
-
-    def _get_put_complete_callback(
+    def _get_tier_put_callback(
         self, backend_name: str
     ) -> Optional[Callable[[CacheEngineKey], None]]:
         if self.tier_manager is None:
@@ -503,7 +478,8 @@ class StorageManager:
             keys,
             memory_objs,
         )
-        self._record_store_observations(keys)
+        if self.tier_manager is not None:
+            self.tier_manager.observe_store(keys)
 
         for backend_name, backend in self.storage_backends.items():
             if location and backend_name != location:
@@ -528,7 +504,7 @@ class StorageManager:
                 ks,
                 objs,
                 transfer_spec=transfer_spec,
-                on_complete_callback=self._get_put_complete_callback(backend_name),
+                on_complete_callback=self._get_tier_put_callback(backend_name),
             )
 
         for cname, (ks, objs) in obj_dict.items():
@@ -560,7 +536,7 @@ class StorageManager:
                     local_cpu_backend.submit_put_task(
                         key,
                         memory_obj,
-                        on_complete_callback=self._get_put_complete_callback(
+                        on_complete_callback=self._get_tier_put_callback(
                             "LocalCPUBackend"
                         ),
                     )
@@ -599,40 +575,42 @@ class StorageManager:
         if not keys:
             return []
 
-        stitched_results: List[Optional[MemoryObj]] = [None] * len(keys)
-        next_key_idx = 0
+        results: List[Optional[MemoryObj]] = []
 
         for backend_name, storage_backend in self.get_active_storage_backends(location):
-            if next_key_idx >= len(keys):
+            if len(results) >= len(keys):
                 break
 
-            remaining_keys = keys[next_key_idx:]
+            remaining_keys = keys[len(results):]
             memory_objs = storage_backend.batched_get_blocking(remaining_keys)
             if not memory_objs:
                 continue
 
-            prefix_hits = len(memory_objs)
-            hit_keys = remaining_keys[:prefix_hits]
-            hit_memory_objs = memory_objs
-            for offset, (key, memory_obj) in enumerate(
-                zip(hit_keys, hit_memory_objs, strict=False)
-            ):
-                stitched_results[next_key_idx + offset] = memory_obj
+            for key, memory_obj in zip(remaining_keys, memory_objs, strict=False):
                 self._record_hit(key)
+            results.extend(memory_objs)
 
             # Align with single-key `get()` logic:
             # auto-write non-CPU results back into local CPU cache.
-            if backend_name not in ["LocalCPUBackend", "PDBackend"]:
+            if (
+                backend_name not in ["LocalCPUBackend", "PDBackend"]
+                and self.local_cpu_backend is not None
+            ):
+                hit_keys = remaining_keys[:len(memory_objs)]
                 logger.debug(
                     "Storing %s objects from %s to LocalCPUBackend",
                     len(hit_keys),
                     backend_name,
                 )
-                self._write_back_to_local_cpu(hit_keys, hit_memory_objs)
+                self.local_cpu_backend.batched_submit_put_task(
+                    hit_keys,
+                    memory_objs,
+                    on_complete_callback=self._get_tier_put_callback(
+                        "LocalCPUBackend"
+                    ),
+                )
 
-            next_key_idx += prefix_hits
-
-        return stitched_results
+        return results
 
     def layerwise_batched_get(
         self,
