@@ -2,8 +2,8 @@
 # Standard
 import copy
 import heapq
-from collections import defaultdict
 from dataclasses import dataclass, field
+from enum import EnumType
 from math import exp, log1p
 from threading import RLock
 from time import time
@@ -38,9 +38,11 @@ class HotnessPolicy:
     any specific Tier enum.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, tier_enum: EnumType) -> None:
         self._states: dict[CacheEngineKey, HotnessState] = {}
-        self._tier_keys: defaultdict[Hashable, set[CacheEngineKey]] = defaultdict(set)
+        self._tier_keys: dict[Hashable, set[CacheEngineKey]] = {
+            t: set() for t in tier_enum
+        }
         self._lock = RLock()
 
     def _get_or_create_state(

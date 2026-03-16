@@ -42,14 +42,13 @@ class TierManager:
     def __init__(
         self,
         storage_manager: "StorageManager",
-        hotness_policy: Optional[HotnessPolicy] = None,
         interval_secs: Optional[float] = None,
         cpu_high_watermark: float = DEFAULT_CPU_HIGH_WATERMARK,
         cpu_low_watermark: float = DEFAULT_CPU_LOW_WATERMARK,
         max_actions_per_tick: int = DEFAULT_MAX_ACTIONS_PER_TICK,
     ) -> None:
         self.storage_manager = storage_manager
-        self.hotness_policy = hotness_policy or HotnessPolicy()
+        self.hotness_policy = HotnessPolicy(Tier)
         self.interval_secs = (
             DEFAULT_TIER_MANAGER_INTERVAL_SECS
             if interval_secs is None
