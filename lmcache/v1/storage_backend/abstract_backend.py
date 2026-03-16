@@ -294,24 +294,6 @@ class StorageBackendInterface(metaclass=abc.ABCMeta):
             hit_chunks += 1
         return hit_chunks
 
-    def run_policy_maintenance(self) -> None:
-        """
-        Run optional background maintenance for the backend cache policy.
-
-        Backends with policies that do not need aging or reindexing should
-        keep the default no-op implementation.
-        """
-        return None
-
-    def requires_policy_maintenance(self) -> bool:
-        """
-        Report whether the backend needs background policy maintenance.
-
-        Returns:
-            True when the backend wants a maintenance loop to invoke
-            :meth:`run_policy_maintenance`, otherwise False.
-        """
-        return False
 
 
 class AllocatorBackendInterface(StorageBackendInterface):

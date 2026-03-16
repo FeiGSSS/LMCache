@@ -204,14 +204,6 @@ class LocalDiskBackend(StorageBackendInterface):
                 self.cache_policy.update_on_hit(key, self.dict)
             self.keys_in_request = []
 
-    def run_policy_maintenance(self) -> None:
-        """Run periodic maintenance for the configured cache policy."""
-        with self.disk_lock:
-            self.cache_policy.periodic_maintenance(self.dict)
-
-    def requires_policy_maintenance(self) -> bool:
-        """Report whether the configured policy needs background maintenance."""
-        return self.cache_policy.requires_periodic_maintenance()
 
     def exists_in_put_tasks(self, key: CacheEngineKey) -> bool:
         return self.disk_worker.exists_in_put_tasks(key)
@@ -378,7 +370,6 @@ class LocalDiskBackend(StorageBackendInterface):
         if not evict_success:
             return None
 
-        self.cache_policy.record_context(key, prefix_pos=prefix_pos)
         memory_obj.ref_count_up()
 
         return asyncio.run_coroutine_threadsafe(

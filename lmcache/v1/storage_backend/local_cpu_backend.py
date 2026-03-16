@@ -144,14 +144,6 @@ class LocalCPUBackend(AllocatorBackendInterface):
                 self.cache_policy.update_on_hit(key, self.hot_cache)
             self.keys_in_request = []
 
-    def run_policy_maintenance(self) -> None:
-        """Run periodic maintenance for the configured cache policy."""
-        with self.cpu_lock:
-            self.cache_policy.periodic_maintenance(self.hot_cache)
-
-    def requires_policy_maintenance(self) -> bool:
-        """Report whether the configured policy needs background maintenance."""
-        return self.cache_policy.requires_periodic_maintenance()
 
     def set_pressure_handler(
         self,
@@ -216,7 +208,6 @@ class LocalCPUBackend(AllocatorBackendInterface):
             memory_obj.ref_count_up()
             self.hot_cache[key] = memory_obj
 
-            self.cache_policy.record_context(key, prefix_pos=prefix_pos)
             self.cache_policy.update_on_put(key)
 
             # Push kv admit msg with batching

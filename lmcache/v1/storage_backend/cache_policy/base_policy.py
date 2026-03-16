@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 from collections.abc import MutableMapping
-from typing import Generic, Optional, TypeVar
+from typing import Generic, TypeVar
 import abc
 
 KeyType = TypeVar("KeyType")
@@ -85,42 +85,3 @@ class BaseCachePolicy(Generic[KeyType, MapType], metaclass=abc.ABCMeta):
             return a list of keys to be evicted
         """
         raise NotImplementedError
-
-    def record_context(
-        self,
-        key: KeyType,
-        *,
-        prefix_pos: Optional[int] = None,
-    ) -> None:
-        """
-        Record optional context for the next policy update of ``key``.
-
-        Args:
-            key: Cache key being updated.
-            prefix_pos: Optional chunk position within the current request.
-        """
-
-    def periodic_maintenance(
-        self,
-        cache_dict: MapType,
-    ) -> None:
-        """
-        Run periodic policy maintenance.
-
-        This hook is invoked by storage backends from a background task when
-        a policy needs aging or periodic reindexing. Policies that do not need
-        maintenance should keep the default no-op implementation.
-
-        Args:
-            cache_dict: The current cache mapping for the backend.
-        """
-
-    def requires_periodic_maintenance(self) -> bool:
-        """
-        Report whether this policy needs background maintenance.
-
-        Returns:
-            True when the backend should periodically call
-            :meth:`periodic_maintenance`, otherwise False.
-        """
-        return False
