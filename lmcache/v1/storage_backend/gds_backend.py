@@ -728,7 +728,7 @@ class GdsBackend(AllocatorBackendInterface):
     def batched_get_blocking(
         self,
         keys: List[CacheEngineKey],
-    ) -> List[MemoryObj]:
+    ) -> List[Optional[MemoryObj]]:
         if self.use_thread_pool:
             logger.info("Using batched_get_blocking with thread pool implementation")
             return self._batched_get_blocking_by_thread_pool_impl(keys)
@@ -738,43 +738,42 @@ class GdsBackend(AllocatorBackendInterface):
     def _batched_get_blocking_by_thread_pool_impl(
         self,
         keys: List[CacheEngineKey],
-    ) -> List[MemoryObj]:
-        prefix_keys: list[CacheEngineKey] = []
-        paths: list[str] = []
-        dtypes: list[torch.dtype] = []
-        shapes: list[torch.Size] = []
+    ) -> list[MemoryObj | None]:
+        paths: list[str | None] = []
+        dtypes: list[torch.dtype | None] = []
+        shapes: list[torch.Size | None] = []
         with self.hot_lock:
             for key in keys:
                 entry = self.hot_cache.get(key)
                 if entry is None:
-                    break
-                prefix_keys.append(key)
+                    logger.error(f"Lookup failed during get_blocking for {key}")
+                    paths.append(None)
+                    dtypes.append(None)
+                    shapes.append(None)
+                    continue
                 paths.append(entry.path)
                 dtypes.append(entry.dtype)
                 shapes.append(entry.shape)
 
-        memory_objs: List[MemoryObj] = []
+        memory_objs: list[MemoryObj | None] = []
         gds_reads, gds_read_bytes = 0, 0
         for dtype, shape, path in zip(dtypes, shapes, paths, strict=True):
+            if path is None:
+                memory_objs.append(None)
+                continue
             memory_obj = self.memory_allocator.allocate(shape, dtype)
             if memory_obj is None:
                 logger.error(f"Memory allocation failed during get_blocking for {path}")
-                break
             else:
                 gds_reads += 1
                 gds_read_bytes += memory_obj.get_size()
             memory_objs.append(memory_obj)
 
-        if len(memory_objs) < len(paths):
-            for memory_obj in memory_objs:
-                memory_obj.ref_count_down()
-            return []
-
         start_time = time.perf_counter()
         assert self._thread_pool is not None
         results = list(
             self._thread_pool.map(
-                self._load_bytes_from_disk_with_memory, prefix_keys, paths, memory_objs
+                self._load_bytes_from_disk_with_memory, keys, paths, memory_objs
             )
         )
         total_time = time.perf_counter() - start_time
@@ -782,16 +781,7 @@ class GdsBackend(AllocatorBackendInterface):
             f"Time taken for batched_get_blocking: {total_time:.3f}s |"
             f" {gds_read_bytes / 1024 / 1024}MiB | {gds_reads} ops."
         )
-        prefix_results: List[MemoryObj] = []
-        for memory_obj in results:
-            if memory_obj is None:
-                break
-            prefix_results.append(memory_obj)
-
-        for memory_obj in results[len(prefix_results) :]:
-            if memory_obj is not None:
-                memory_obj.ref_count_down()
-        return prefix_results
+        return results
 
     @_lmcache_nvtx_annotate
     @torch.inference_mode()

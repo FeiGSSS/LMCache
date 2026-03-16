@@ -35,9 +35,6 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
-def _resolve_backend_policy_name(policy_name: str) -> str:
-    return "LRU" if policy_name.upper() == "HOTNESS" else policy_name
-
 
 class LocalCPUBackend(AllocatorBackendInterface):
     """
@@ -59,9 +56,8 @@ class LocalCPUBackend(AllocatorBackendInterface):
         else:
             super().__init__("cpu")
 
-        self.cache_policy = get_cache_policy(
-            _resolve_backend_policy_name(config.cache_policy)
-        )
+        backend_policy = "LRU" if config.cache_policy.upper() == "HOTNESS" else config.cache_policy
+        self.cache_policy = get_cache_policy(backend_policy)
         self.hot_cache = self.cache_policy.init_mutable_mapping()
 
         self.use_hot = config.local_cpu
