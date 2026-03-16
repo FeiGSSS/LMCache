@@ -336,7 +336,8 @@ def test_hotness_tier_manager_thread_runs(event_manager, monkeypatch):
         chunk_size=256,
         local_cpu=True,
         max_local_cpu_size=0.01,
-        cache_policy="HOTNESS",
+        enable_tiering=True,
+        cache_policy="LRU",
         lmcache_instance_id="test_instance",
     )
     metadata = LMCacheMetadata(
@@ -396,7 +397,8 @@ def test_hotness_registers_cpu_pressure_handler(event_manager, monkeypatch):
         chunk_size=256,
         local_cpu=True,
         max_local_cpu_size=0.01,
-        cache_policy="HOTNESS",
+        enable_tiering=True,
+        cache_policy="LRU",
         lmcache_instance_id="test_instance",
     )
     metadata = LMCacheMetadata(
@@ -549,7 +551,10 @@ def test_batched_get_stitches_prefix_hits_across_backends(storage_manager):
             for key in query_keys:
                 idx = self.keys.index(key)
                 if idx >= 5:
-                    return [self.objs[self.keys.index(hit_key)] for hit_key in query_keys[:idx]]
+                    return [
+                        self.objs[self.keys.index(hit_key)]
+                        for hit_key in query_keys[:idx]
+                    ]
             return [self.objs[self.keys.index(key)] for key in query_keys]
 
     class FakeDiskBackend:

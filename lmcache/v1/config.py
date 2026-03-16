@@ -277,6 +277,11 @@ _CONFIG_DEFINITIONS: dict[str, dict[str, Any]] = {
         "default": "LRU",
         "env_converter": str,
     },
+    "enable_tiering": {
+        "type": bool,
+        "default": False,
+        "env_converter": _to_bool,
+    },
     "numa_mode": {
         "type": Optional[str],
         "default": None,

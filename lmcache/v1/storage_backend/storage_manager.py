@@ -290,11 +290,11 @@ class StorageManager:
             assert self.allocator_backend is not None
             self.async_serializer = AsyncSingleSerializer(self.loop)
 
-        if self._is_hotness_enabled():
+        if self._is_tiering_enabled():
             self.hotness_policy = HotnessPolicy()
             self.tier_manager = TierManager(self, self.hotness_policy)
             self._refresh_cpu_pressure_handler()
-            self._refresh_hotness_backend_hooks()
+            self._refresh_tiering_backend_hooks()
             self.tier_manager.start()
         self._setup_metrics()
 
@@ -453,18 +453,18 @@ class StorageManager:
             high_watermark = self.tier_manager.cpu_high_watermark
         self.local_cpu_backend.set_pressure_handler(handler, high_watermark)
 
-    def _refresh_hotness_backend_hooks(self) -> None:
+    def _refresh_tiering_backend_hooks(self) -> None:
         callback: Optional[Callable[[CacheEngineKey], None]]
         for backend_name, backend in self.storage_backends.items():
             if not hasattr(backend, "set_internal_evict_callback"):
                 continue
 
             callback = None
-            if self.hotness_policy is not None:
+            if self.tier_manager is not None:
                 callback = self._make_internal_evict_callback(backend_name)
             cast(Any, backend).set_internal_evict_callback(callback)
 
-    def _clear_hotness_tier(self, backend_name: str) -> None:
+    def _clear_tier(self, backend_name: str) -> None:
         if self.hotness_policy is None:
             return
 
@@ -473,8 +473,8 @@ class StorageManager:
             return
         self.hotness_policy.clear_tier(tier)
 
-    def _is_hotness_enabled(self) -> bool:
-        return self.config.cache_policy.upper() == "HOTNESS"
+    def _is_tiering_enabled(self) -> bool:
+        return self.config.enable_tiering
 
     def is_tier_manager_running(self) -> bool:
         if self.tier_manager is None:
@@ -1238,7 +1238,7 @@ class StorageManager:
         for backend_name, backend in self.storage_backends.items():
             if locations is None or backend_name in locations:
                 tier = self._backend_name_to_tier(backend_name)
-                if self.hotness_policy is not None and tier is not None:
+                if self.tier_manager is not None and tier is not None:
                     for key in keys:
                         removed = backend.remove(key)
                         num_removed += removed
@@ -1291,7 +1291,7 @@ class StorageManager:
             if locations is None or backend_name in locations:
                 if hasattr(backend, "clear"):
                     num_cleared_tokens += backend.clear()
-                    self._clear_hotness_tier(backend_name)
+                    self._clear_tier(backend_name)
                 else:
                     logger.warning(
                         f"Storage backend {backend_name} does not support "
@@ -1415,7 +1415,7 @@ class StorageManager:
             self.non_allocator_backends = self.get_non_allocator_backends()
             if backend_name == "LocalCPUBackend":
                 self.local_cpu_backend = None
-            self._clear_hotness_tier(backend_name)
+            self._clear_tier(backend_name)
             logger.info("Backend %s closed and removed", backend_name)
         return True
 
@@ -1463,7 +1463,7 @@ class StorageManager:
                 self.local_cpu_backend = cpu
 
         self._refresh_cpu_pressure_handler()
-        self._refresh_hotness_backend_hooks()
+        self._refresh_tiering_backend_hooks()
         return created
 
     def recreate_backend(self, backend_name: str) -> Dict[str, str]:
@@ -1502,7 +1502,7 @@ class StorageManager:
                 backend.close()
             except Exception:
                 logger.exception("Error closing backend %s", backend_name)
-            self._clear_hotness_tier(backend_name)
+            self._clear_tier(backend_name)
             del self.storage_backends[backend_name]
 
             # --- create ---
@@ -1536,7 +1536,7 @@ class StorageManager:
                 self.local_cpu_backend = None
 
         self._refresh_cpu_pressure_handler()
-        self._refresh_hotness_backend_hooks()
+        self._refresh_tiering_backend_hooks()
         return created
 
     def close(self):
@@ -1554,7 +1554,7 @@ class StorageManager:
                     backend.set_pressure_handler(None)
                 if hasattr(backend, "set_internal_evict_callback"):
                     cast(Any, backend).set_internal_evict_callback(None)
-                self._clear_hotness_tier(name)
+                self._clear_tier(name)
                 backend.close()
                 logger.info(f"Storage backend {name} closed successfully")
             except Exception as e:

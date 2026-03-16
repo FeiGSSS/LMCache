@@ -35,7 +35,6 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
-
 class LocalCPUBackend(AllocatorBackendInterface):
     """
     Even if local_cpu is False (the hot_cache is not used), contains(),
@@ -56,8 +55,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
         else:
             super().__init__("cpu")
 
-        backend_policy = "LRU" if config.cache_policy.upper() == "HOTNESS" else config.cache_policy
-        self.cache_policy = get_cache_policy(backend_policy)
+        self.cache_policy = get_cache_policy(config.cache_policy)
         self.hot_cache = self.cache_policy.init_mutable_mapping()
 
         self.use_hot = config.local_cpu
@@ -79,9 +77,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
         self._pressure_handler: Optional[Callable[[], bool]] = None
         self._pressure_high_watermark: Optional[float] = None
         self._pressure_handler_lock = threading.Lock()
-        self._internal_evict_callback: Optional[Callable[[CacheEngineKey], None]] = (
-            None
-        )
+        self._internal_evict_callback: Optional[Callable[[CacheEngineKey], None]] = None
         self._internal_evict_callback_lock = threading.Lock()
 
         self.stats_monitor = LMCStatsMonitor.GetOrCreate()
@@ -139,7 +135,6 @@ class LocalCPUBackend(AllocatorBackendInterface):
             for key in reversed(self.keys_in_request):
                 self.cache_policy.update_on_hit(key, self.hot_cache)
             self.keys_in_request = []
-
 
     def set_pressure_handler(
         self,

@@ -114,9 +114,12 @@ def test_update_config_from_env_error_handling():
     del os.environ["LMCACHE_CONTROLLER_PULL_URL"]
 
 
-def test_hotness_cache_policy_config():
-    config = LMCacheEngineConfig.from_defaults(cache_policy="HOTNESS")
-    assert config.cache_policy == "HOTNESS"
+def test_enable_tiering_config():
+    config = LMCacheEngineConfig.from_defaults(enable_tiering=True)
+    assert config.enable_tiering is True
+
+    config_default = LMCacheEngineConfig.from_defaults()
+    assert config_default.enable_tiering is False
 
 
 @pytest.mark.parametrize("use_mla", [True, False])

@@ -281,14 +281,6 @@ class TestLocalCPUBackend:
 
         local_cpu_backend_disabled.memory_allocator.close()
 
-    def test_hotness_uses_lru_fallback_policy(self, memory_allocator):
-        """Test HOTNESS config uses backend-local fallback policy."""
-        config = create_test_config(cache_policy="HOTNESS")
-        backend = LocalCPUBackend(config=config, memory_allocator=memory_allocator)
-        assert backend.cache_policy.__class__.__name__ == "LRUCachePolicy"
-
-        backend.memory_allocator.close()
-
     def test_get_blocking_key_not_exists(self, local_cpu_backend):
         """Test get_blocking() when key doesn't exist."""
         key = create_test_key("nonexistent")
@@ -647,9 +639,7 @@ class TestLocalCPUBackend:
             backend.close()
             PinMonitor.DestroyInstance()
 
-    def test_get_capacity_bytes_matches_effective_allocator_capacity(
-        self, monkeypatch
-    ):
+    def test_get_capacity_bytes_matches_effective_allocator_capacity(self, monkeypatch):
         """Test get_capacity_bytes() reflects allocator sizing adjustments."""
         config = create_test_config()
         config.max_local_cpu_size = 8

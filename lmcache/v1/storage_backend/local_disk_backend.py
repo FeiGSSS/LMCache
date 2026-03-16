@@ -33,7 +33,6 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
-
 # TODO(Jiayi): handle cases where cache is repetitvely prefetched.
 class LocalDiskWorker:
     def __init__(self, loop: asyncio.AbstractEventLoop) -> None:
@@ -110,8 +109,7 @@ class LocalDiskBackend(StorageBackendInterface):
         else:
             super().__init__("cpu")
 
-        backend_policy = "LRU" if config.cache_policy.upper() == "HOTNESS" else config.cache_policy
-        self.cache_policy = get_cache_policy(backend_policy)
+        self.cache_policy = get_cache_policy(config.cache_policy)
         self.dict = self.cache_policy.init_mutable_mapping()
 
         self.dst_device = dst_device
@@ -129,9 +127,7 @@ class LocalDiskBackend(StorageBackendInterface):
         self.loop = loop
 
         self.use_local_cpu = config.local_cpu
-        self._internal_evict_callback: Optional[Callable[[CacheEngineKey], None]] = (
-            None
-        )
+        self._internal_evict_callback: Optional[Callable[[CacheEngineKey], None]] = None
         self._internal_evict_callback_lock = threading.Lock()
 
         # Block size (for file system I/O)
@@ -199,7 +195,6 @@ class LocalDiskBackend(StorageBackendInterface):
             for key in reversed(self.keys_in_request):
                 self.cache_policy.update_on_hit(key, self.dict)
             self.keys_in_request = []
-
 
     def exists_in_put_tasks(self, key: CacheEngineKey) -> bool:
         return self.disk_worker.exists_in_put_tasks(key)

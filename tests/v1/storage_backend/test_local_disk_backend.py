@@ -192,18 +192,3 @@ class TestLocalDiskBackend:
         assert result is None
 
         local_disk_backend.local_cpu_backend.memory_allocator.close()
-
-    def test_hotness_uses_lru_fallback_policy(
-        self, temp_disk_path, async_loop, local_cpu_backend
-    ):
-        """Test HOTNESS config uses backend-local fallback policy."""
-        config = create_test_config(temp_disk_path, cache_policy="HOTNESS")
-        backend = LocalDiskBackend(
-            config=config,
-            loop=async_loop,
-            local_cpu_backend=local_cpu_backend,
-            dst_device="cuda",
-        )
-        assert backend.cache_policy.__class__.__name__ == "LRUCachePolicy"
-
-        local_cpu_backend.memory_allocator.close()

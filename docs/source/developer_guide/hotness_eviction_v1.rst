@@ -9,7 +9,7 @@ Overview
 This document describes the current V1 hotness-based tier-management
 architecture in LMCache. It is a design, implementation, and behavior
 specification for the path that is enabled when
-``cache_policy="HOTNESS"``.
+``enable_tiering=True``.
 
 At a high level, the system does three things:
 
@@ -233,7 +233,7 @@ Why this split exists:
 StorageManager Integration
 --------------------------
 
-When ``cache_policy="HOTNESS"``:
+When ``enable_tiering=True``:
 
 * ``StorageManager`` creates a global ``HotnessPolicy``
 * ``StorageManager`` creates a ``TierManager``
@@ -242,7 +242,7 @@ When ``cache_policy="HOTNESS"``:
 * ``StorageManager`` registers internal-evict callbacks on backends that support them
 * ``StorageManager`` starts the background ``TierManager`` thread
 
-When ``cache_policy`` is anything else:
+When ``enable_tiering=False`` (the default):
 
 * no global ``HotnessPolicy`` is created
 * no ``TierManager`` is started
@@ -251,15 +251,8 @@ When ``cache_policy`` is anything else:
 Backend Policy Compatibility
 ----------------------------
 
-Even when ``cache_policy="HOTNESS"``, backend-local policies do not become
-``HotnessPolicy``.
-
-Instead:
-
-* ``LocalCPUBackend`` maps backend-local ``HOTNESS`` to local ``LRU``
-* ``LocalDiskBackend`` maps backend-local ``HOTNESS`` to local ``LRU``
-
-This preserves existing local fallback behavior:
+When ``enable_tiering=True``, backend-local eviction policies remain
+independent of ``HotnessPolicy``.
 
 * allocator-driven local eviction still works
 * backend-local key ordering still exists for emergency fallback
@@ -549,7 +542,7 @@ Lifecycle Behavior
 Startup
 ~~~~~~~
 
-On ``StorageManager`` creation with ``cache_policy="HOTNESS"``:
+On ``StorageManager`` creation with ``enable_tiering=True``:
 
 * create backends
 * create ``HotnessPolicy``
@@ -654,7 +647,7 @@ The main regression and behavior tests are:
 Functional Summary
 ------------------
 
-With ``cache_policy="HOTNESS"``, the system provides:
+With ``enable_tiering=True``, the system provides:
 
 * global hotness-aware cross-tier decisions
 * callback-accurate tier residency tracking
