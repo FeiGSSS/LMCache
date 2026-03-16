@@ -11,15 +11,16 @@ from typing import Optional, Sequence
 
 # First Party
 from lmcache.utils import CacheEngineKey
-from lmcache.v1.storage_backend.hotness_constants import (
-    AGE_DECAY,
-    AGE_WEIGHT,
-    HIT_CAP,
-    HIT_WEIGHT,
-    PREFIX_DECAY,
-    PREFIX_WEIGHT,
-    PROMOTION_MARGIN,
-)
+
+HIT_CAP = 32
+PREFIX_DECAY = 16.0
+AGE_DECAY = 32.0
+
+PREFIX_WEIGHT = 0.45
+AGE_WEIGHT = 0.35
+HIT_WEIGHT = 0.20
+
+PROMOTION_MARGIN = 0.05
 
 # Re-export for backwards compatibility with existing imports
 HOTNESS_HIT_CAP = HIT_CAP
