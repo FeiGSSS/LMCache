@@ -1,24 +1,34 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
+import copy
+import heapq
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from math import exp, log1p
 from threading import RLock
 from time import time
-from typing import Optional
+from typing import Optional, Sequence
 
 # First Party
 from lmcache.utils import CacheEngineKey
+from lmcache.v1.storage_backend.hotness_constants import (
+    AGE_DECAY,
+    AGE_WEIGHT,
+    HIT_CAP,
+    HIT_WEIGHT,
+    PREFIX_DECAY,
+    PREFIX_WEIGHT,
+    PROMOTION_MARGIN,
+)
 
-HOTNESS_HIT_CAP = 32
-HOTNESS_PREFIX_DECAY = 16.0
-HOTNESS_AGE_DECAY_SECS = 32.0
-
-HOTNESS_PREFIX_WEIGHT = 0.45
-HOTNESS_AGE_WEIGHT = 0.35
-HOTNESS_HIT_WEIGHT = 0.20
-
-HOTNESS_PROMOTION_MARGIN = 0.05
+# Re-export for backwards compatibility with existing imports
+HOTNESS_HIT_CAP = HIT_CAP
+HOTNESS_PREFIX_DECAY = PREFIX_DECAY
+HOTNESS_AGE_DECAY_SECS = AGE_DECAY
+HOTNESS_PREFIX_WEIGHT = PREFIX_WEIGHT
+HOTNESS_AGE_WEIGHT = AGE_WEIGHT
+HOTNESS_HIT_WEIGHT = HIT_WEIGHT
+HOTNESS_PROMOTION_MARGIN = PROMOTION_MARGIN
 
 
 class Tier(Enum):
@@ -50,6 +60,28 @@ class HotnessPolicy:
         }
         self._lock = RLock()
 
+    def _get_or_create_state(
+        self,
+        key: CacheEngineKey,
+        timestamp: float,
+        prefix_pos: int = 0,
+    ) -> HotnessState:
+        """
+        Return the existing state for *key*, or create and register a new one.
+
+        Must be called while holding ``_lock``.
+        """
+        state = self._states.get(key)
+        if state is None:
+            state = HotnessState(
+                prefix_pos=max(prefix_pos, 0),
+                hit_count=0,
+                insert_ts=timestamp,
+                last_hit_ts=timestamp,
+            )
+            self._states[key] = state
+        return state
+
     def observe_store(
         self,
         key: CacheEngineKey,
@@ -63,12 +95,7 @@ class HotnessPolicy:
         with self._lock:
             state = self._states.get(key)
             if state is None:
-                self._states[key] = HotnessState(
-                    prefix_pos=max(prefix_pos, 0),
-                    hit_count=0,
-                    insert_ts=timestamp,
-                    last_hit_ts=timestamp,
-                )
+                self._get_or_create_state(key, timestamp, prefix_pos=prefix_pos)
                 return
             state.prefix_pos = min(state.prefix_pos, max(prefix_pos, 0))
 
@@ -82,17 +109,24 @@ class HotnessPolicy:
         """
         timestamp = time() if now is None else now
         with self._lock:
-            state = self._states.get(key)
-            if state is None:
-                self._states[key] = HotnessState(
-                    prefix_pos=0,
-                    hit_count=1,
-                    insert_ts=timestamp,
-                    last_hit_ts=timestamp,
-                )
-                return
+            state = self._get_or_create_state(key, timestamp)
             state.hit_count += 1
             state.last_hit_ts = timestamp
+
+    def batch_on_hit(
+        self,
+        keys: Sequence[CacheEngineKey],
+        now: Optional[float] = None,
+    ) -> None:
+        """
+        Record cache hits for multiple *keys* under a single lock acquisition.
+        """
+        timestamp = time() if now is None else now
+        with self._lock:
+            for key in keys:
+                state = self._get_or_create_state(key, timestamp)
+                state.hit_count += 1
+                state.last_hit_ts = timestamp
 
     def mark_resident(
         self,
@@ -102,18 +136,18 @@ class HotnessPolicy:
     ) -> None:
         """
         Update tier residency for ``key`` after a successful action.
+
+        If ``present`` is True and no state exists yet, a new state is created.
+        If ``present`` is False and no state exists, this is a no-op.
         """
         with self._lock:
             state = self._states.get(key)
             if state is None:
-                now = time()
-                state = HotnessState(
-                    prefix_pos=0,
-                    hit_count=0,
-                    insert_ts=now,
-                    last_hit_ts=now,
-                )
-                self._states[key] = state
+                if not present:
+                    # Removing residency for an unknown key is a no-op.
+                    self._tier_keys[tier].discard(key)
+                    return
+                state = self._get_or_create_state(key, time())
 
             if present:
                 state.resident_tiers.add(tier)
@@ -142,10 +176,19 @@ class HotnessPolicy:
 
     def get_state(self, key: CacheEngineKey) -> Optional[HotnessState]:
         """
-        Get current hotness state for ``key``.
+        Get a snapshot of the current hotness state for ``key``.
+
+        Returns a copy so that callers can read fields without
+        holding the policy lock.  The ``resident_tiers`` set is
+        copied so mutations do not affect internal state.
         """
         with self._lock:
-            return self._states.get(key)
+            state = self._states.get(key)
+            if state is None:
+                return None
+            snapshot = copy.copy(state)
+            snapshot.resident_tiers = set(state.resident_tiers)
+            return snapshot
 
     def get_score(
         self,
@@ -178,19 +221,23 @@ class HotnessPolicy:
     ) -> list[CacheEngineKey]:
         """
         Select the coldest keys currently resident in ``tier``.
+
+        Uses ``heapq.nsmallest`` to avoid a full sort — O(n log limit)
+        instead of O(n log n).
         """
         timestamp = time() if now is None else now
         excluded = exclude or set()
         with self._lock:
-            candidates = [
+            candidates = (
                 key
                 for key in self._tier_keys[tier]
                 if key not in excluded and key in self._states
-            ]
-            candidates.sort(
-                key=lambda key: self._compute_score(self._states[key], timestamp)
             )
-            return candidates[:limit]
+            return heapq.nsmallest(
+                limit,
+                candidates,
+                key=lambda k: self._compute_score(self._states[k], timestamp),
+            )
 
     def select_hottest(
         self,
@@ -202,6 +249,9 @@ class HotnessPolicy:
     ) -> list[CacheEngineKey]:
         """
         Select the hottest keys currently resident in ``tier``.
+
+        Uses ``heapq.nlargest`` to avoid a full sort — O(n log limit)
+        instead of O(n log n).
         """
         timestamp = time() if now is None else now
         excluded = exclude or set()
@@ -217,11 +267,11 @@ class HotnessPolicy:
                 ):
                     continue
                 candidates.append(key)
-            candidates.sort(
-                key=lambda key: self._compute_score(self._states[key], timestamp),
-                reverse=True,
+            return heapq.nlargest(
+                limit,
+                candidates,
+                key=lambda k: self._compute_score(self._states[k], timestamp),
             )
-            return candidates[:limit]
 
     def refresh(self) -> None:
         """
@@ -232,12 +282,12 @@ class HotnessPolicy:
         return None
 
     def _compute_score(self, state: HotnessState, now: float) -> float:
-        prefix_score = exp(-state.prefix_pos / HOTNESS_PREFIX_DECAY)
+        prefix_score = exp(-state.prefix_pos / PREFIX_DECAY)
         age_secs = max(now - state.last_hit_ts, 0.0)
-        age_score = exp(-age_secs / HOTNESS_AGE_DECAY_SECS)
-        hit_score = min(log1p(state.hit_count) / log1p(HOTNESS_HIT_CAP), 1.0)
+        age_score = exp(-age_secs / AGE_DECAY)
+        hit_score = min(log1p(state.hit_count) / log1p(HIT_CAP), 1.0)
         return (
-            HOTNESS_PREFIX_WEIGHT * prefix_score
-            + HOTNESS_AGE_WEIGHT * age_score
-            + HOTNESS_HIT_WEIGHT * hit_score
+            PREFIX_WEIGHT * prefix_score
+            + AGE_WEIGHT * age_score
+            + HIT_WEIGHT * hit_score
         )

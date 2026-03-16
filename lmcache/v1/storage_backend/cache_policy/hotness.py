@@ -8,19 +8,20 @@ from typing import Any
 # First Party
 from lmcache.logging import init_logger
 from lmcache.v1.storage_backend.cache_policy.base_policy import BaseCachePolicy, KeyType
+from lmcache.v1.storage_backend.hotness_constants import (
+    AGE_DECAY,
+    AGE_WEIGHT,
+    HIT_CAP,
+    HIT_WEIGHT,
+    PREFIX_DECAY,
+    PREFIX_WEIGHT,
+)
 
 logger = init_logger(__name__)
 
 HOTNESS_BUCKETS = 256
 MAX_PREFIX_POS = HOTNESS_BUCKETS - 1
 MAX_AGE_TICKS = HOTNESS_BUCKETS - 1
-HIT_CAP = 32
-PREFIX_DECAY = 16.0
-AGE_DECAY = 32.0
-
-PREFIX_WEIGHT = 0.45
-AGE_WEIGHT = 0.35
-HIT_WEIGHT = 0.20
 
 PREFIX_LUT = [
     exp(-prefix_pos / PREFIX_DECAY) for prefix_pos in range(HOTNESS_BUCKETS)
@@ -49,6 +50,12 @@ class HotnessCachePolicy(BaseCachePolicy[KeyType, OrderedDict[KeyType, Any]]):
     - prefix position within the request
     - age in background-maintenance ticks
     - hit count since insertion
+
+    Thread safety
+    -------------
+    This class is **not** internally synchronized.  All calls must be
+    serialized by the owning backend's lock (the same lock that protects
+    the ``cache_dict``).
     """
 
     def __init__(self) -> None:

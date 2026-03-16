@@ -58,6 +58,10 @@ class TierManager:
         self._state_lock = Lock()
         self._pressure_lock = Lock()
 
+        # Cached backend references (populated lazily).
+        self._cached_cpu_backend: Optional[object] = None
+        self._cached_disk_backend: Optional[object] = None
+
     def start(self) -> None:
         """
         Start the background tier-management loop.
@@ -294,16 +298,25 @@ class TierManager:
                 self.hotness_policy.mark_resident(key, Tier.CPU, False)
             return False
 
-        demote_state = {"completed": False}
+        # Use a threading.Event to reliably synchronize callback completion
+        # when *blocking* is True, avoiding the race where we read
+        # ``demote_result`` before the callback has written it.
+        done_event = Event()
+        demote_result = [False]  # mutable container for callback to write to
 
         def _complete_demote(completed_key: CacheEngineKey) -> None:
-            self.hotness_policy.mark_resident(completed_key, Tier.DISK, True)
-            if self._remove_cpu_if_evictable(
-                cpu_backend, completed_key
-            ) or not cpu_backend.contains(completed_key):
-                self.hotness_policy.mark_resident(completed_key, Tier.CPU, False)
-                demote_state["completed"] = True
-            memory_obj.ref_count_down()
+            try:
+                self.hotness_policy.mark_resident(completed_key, Tier.DISK, True)
+                if self._remove_cpu_if_evictable(
+                    cpu_backend, completed_key
+                ) or not cpu_backend.contains(completed_key):
+                    self.hotness_policy.mark_resident(
+                        completed_key, Tier.CPU, False
+                    )
+                    demote_result[0] = True
+            finally:
+                memory_obj.ref_count_down()
+                done_event.set()
 
         put_future = disk_backend.submit_put_task(
             key,
@@ -319,9 +332,13 @@ class TierManager:
                 put_future.result()
             except Exception:
                 logger.exception("Blocking demote failed for key %s", key)
-                memory_obj.ref_count_down()
+                # Only release if the callback hasn't already run.
+                if not done_event.is_set():
+                    memory_obj.ref_count_down()
                 return False
-            return demote_state["completed"]
+            # Wait for the callback to finish (may already be done).
+            done_event.wait()
+            return demote_result[0]
 
         return True
 
@@ -368,6 +385,8 @@ class TierManager:
             memory_obj.ref_count_down()
 
     def _get_cpu_backend(self) -> Optional[object]:
+        if self._cached_cpu_backend is not None:
+            return self._cached_cpu_backend
         backend = self.storage_manager.storage_backends.get("LocalCPUBackend")
         if backend is None:
             return None
@@ -381,7 +400,8 @@ class TierManager:
             "submit_put_task",
         )
         if all(hasattr(backend, method_name) for method_name in required_methods):
-            return cast(object, backend)
+            self._cached_cpu_backend = cast(object, backend)
+            return self._cached_cpu_backend
         return None
 
     def _remove_cpu_if_evictable(
@@ -392,10 +412,13 @@ class TierManager:
         return bool(cpu_backend.remove_if_evictable(key))
 
     def _get_disk_backend(self) -> Optional[object]:
+        if self._cached_disk_backend is not None:
+            return self._cached_disk_backend
         backend = self.storage_manager.storage_backends.get("LocalDiskBackend")
         if backend is None:
             return None
         required_methods = ("get_blocking", "submit_put_task", "contains")
         if all(hasattr(backend, method_name) for method_name in required_methods):
-            return cast(object, backend)
+            self._cached_disk_backend = cast(object, backend)
+            return self._cached_disk_backend
         return None
