@@ -338,11 +338,6 @@ class StorageManager:
             return None
         return self.tier_manager.make_put_complete_callback(backend_name)
 
-    def _clear_tier(self, backend_name: str) -> None:
-        if self.tier_manager is None:
-            return
-        self.tier_manager.clear_tier_by_name(backend_name)
-
     def _is_tiering_enabled(self) -> bool:
         return self.config.enable_tiering
 
@@ -1116,16 +1111,13 @@ class StorageManager:
         num_removed = 0
         for backend_name, backend in self.storage_backends.items():
             if locations is None or backend_name in locations:
-                if self.tier_manager is not None:
-                    for key in keys:
-                        removed = backend.remove(key)
-                        num_removed += removed
-                        if removed:
-                            self.tier_manager.mark_resident_by_name(
-                                key, backend_name, False
-                            )
-                else:
-                    num_removed += backend.batched_remove(keys)
+                for key in keys:
+                    removed = backend.remove(key)
+                    num_removed += removed
+                    if removed and self.tier_manager is not None:
+                        self.tier_manager.mark_resident_by_name(
+                            key, backend_name, False
+                        )
 
         return num_removed
 
@@ -1171,7 +1163,8 @@ class StorageManager:
             if locations is None or backend_name in locations:
                 if hasattr(backend, "clear"):
                     num_cleared_tokens += backend.clear()
-                    self._clear_tier(backend_name)
+                    if self.tier_manager is not None:
+                        self.tier_manager.clear_tier_by_name(backend_name)
                 else:
                     logger.warning(
                         f"Storage backend {backend_name} does not support "
@@ -1295,7 +1288,8 @@ class StorageManager:
             self.non_allocator_backends = self.get_non_allocator_backends()
             if backend_name == "LocalCPUBackend":
                 self.local_cpu_backend = None
-            self._clear_tier(backend_name)
+            if self.tier_manager is not None:
+                self.tier_manager.clear_tier_by_name(backend_name)
             logger.info("Backend %s closed and removed", backend_name)
         return True
 
@@ -1382,7 +1376,8 @@ class StorageManager:
                 backend.close()
             except Exception:
                 logger.exception("Error closing backend %s", backend_name)
-            self._clear_tier(backend_name)
+            if self.tier_manager is not None:
+                self.tier_manager.clear_tier_by_name(backend_name)
             del self.storage_backends[backend_name]
 
             # --- create ---
@@ -1430,11 +1425,6 @@ class StorageManager:
         for name, backend in self.storage_backends.items():
             try:
                 logger.info(f"Closing storage backend: {name}")
-                if name == "LocalCPUBackend" and isinstance(backend, LocalCPUBackend):
-                    backend.set_pressure_handler(None)
-                if hasattr(backend, "set_internal_evict_callback"):
-                    cast(Any, backend).set_internal_evict_callback(None)
-                self._clear_tier(name)
                 backend.close()
                 logger.info(f"Storage backend {name} closed successfully")
             except Exception as e:
