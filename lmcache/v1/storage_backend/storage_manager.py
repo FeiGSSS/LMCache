@@ -5,7 +5,6 @@ from concurrent.futures import Future
 from typing import (
     TYPE_CHECKING,
     Any,
-    Callable,
     Coroutine,
     Dict,
     Generator,
@@ -326,18 +325,6 @@ class StorageManager:
         assert isinstance(allocator_backend, AllocatorBackendInterface)
         return allocator_backend
 
-    def _record_hit(self, key: CacheEngineKey) -> None:
-        if self.tier_manager is None:
-            return
-        self.tier_manager.on_hit(key)
-
-    def _get_tier_put_callback(
-        self, backend_name: str
-    ) -> Optional[Callable[[CacheEngineKey], None]]:
-        if self.tier_manager is None:
-            return None
-        return self.tier_manager.make_put_complete_callback(backend_name)
-
     def _is_tiering_enabled(self) -> bool:
         return self.config.enable_tiering
 
@@ -435,7 +422,7 @@ class StorageManager:
             memory_objs,
         )
         if self.tier_manager is not None:
-            self.tier_manager.observe_store(keys)
+            self.tier_manager.observe_put(keys)
 
         for backend_name, backend in self.storage_backends.items():
             if location and backend_name != location:
@@ -460,7 +447,9 @@ class StorageManager:
                 ks,
                 objs,
                 transfer_spec=transfer_spec,
-                on_complete_callback=self._get_tier_put_callback(backend_name),
+                on_complete_callback=self.tier_manager.make_put_complete_callback(backend_name)
+                    if self.tier_manager is not None
+                    else None,
             )
 
         for cname, (ks, objs) in obj_dict.items():
@@ -482,7 +471,8 @@ class StorageManager:
             # are allocated by the allocator backend.
             memory_obj = backend.get_blocking(key)
             if memory_obj:
-                self._record_hit(key)
+                if self.tier_manager is not None:
+                    self.tier_manager.observe_get(key)
                 if (
                     backend_name not in ["LocalCPUBackend", "PDBackend"]
                     and "LocalCPUBackend" in self.storage_backends
@@ -492,9 +482,9 @@ class StorageManager:
                     local_cpu_backend.submit_put_task(
                         key,
                         memory_obj,
-                        on_complete_callback=self._get_tier_put_callback(
-                            "LocalCPUBackend"
-                        ),
+                        on_complete_callback=self.tier_manager.make_put_complete_callback("LocalCPUBackend")
+                        if self.tier_manager is not None
+                        else None,
                     )
                 return memory_obj
 
@@ -547,7 +537,8 @@ class StorageManager:
                 continue
 
             for key, memory_obj in zip(remaining_keys, memory_objs, strict=False):
-                self._record_hit(key)
+                if self.tier_manager is not None:
+                    self.tier_manager.observe_get(key)
             results.extend(memory_objs)
 
             # Align with single-key `get()` logic:
@@ -565,9 +556,9 @@ class StorageManager:
                 self.local_cpu_backend.batched_submit_put_task(
                     hit_keys,
                     memory_objs,
-                    on_complete_callback=self._get_tier_put_callback(
-                        "LocalCPUBackend"
-                    ),
+                    on_complete_callback=self.tier_manager.make_put_complete_callback("LocalCPUBackend")
+                    if self.tier_manager is not None
+                    else None,
                 )
 
         return results
@@ -1083,8 +1074,8 @@ class StorageManager:
                 removed = backend.remove(key)
                 num_removed += removed
                 if removed and self.tier_manager is not None:
-                    self.tier_manager.mark_resident_by_name(
-                        key, backend_name, False
+                    self.tier_manager.remove_resident_by_name(
+                        key, backend_name
                     )
 
         return num_removed
@@ -1115,8 +1106,8 @@ class StorageManager:
                     removed = backend.remove(key)
                     num_removed += removed
                     if removed and self.tier_manager is not None:
-                        self.tier_manager.mark_resident_by_name(
-                            key, backend_name, False
+                        self.tier_manager.remove_resident_by_name(
+                            key, backend_name
                         )
 
         return num_removed
@@ -1272,12 +1263,8 @@ class StorageManager:
 
             try:
                 logger.info("Closing backend: %s", backend_name)
-                if backend_name == "LocalCPUBackend" and isinstance(
-                    backend, LocalCPUBackend
-                ):
-                    backend.set_pressure_handler(None)
-                if hasattr(backend, "set_internal_evict_callback"):
-                    cast(Any, backend).set_internal_evict_callback(None)
+                if self.tier_manager is not None:
+                    self.tier_manager.teardown_backend_hooks(backend_name)
                 backend.close()
             except Exception:
                 logger.exception("Error closing backend %s", backend_name)
@@ -1367,12 +1354,8 @@ class StorageManager:
             # --- close ---
             try:
                 logger.info("Closing backend: %s", backend_name)
-                if backend_name == "LocalCPUBackend" and isinstance(
-                    backend, LocalCPUBackend
-                ):
-                    backend.set_pressure_handler(None)
-                if hasattr(backend, "set_internal_evict_callback"):
-                    cast(Any, backend).set_internal_evict_callback(None)
+                if self.tier_manager is not None:
+                    self.tier_manager.teardown_backend_hooks(backend_name)
                 backend.close()
             except Exception:
                 logger.exception("Error closing backend %s", backend_name)
@@ -1419,7 +1402,7 @@ class StorageManager:
 
         if self.tier_manager is not None:
             self.tier_manager.stop()
-            self.tier_manager.teardown_cpu_pressure_handler()
+            self.tier_manager.teardown_backend_hooks()
 
         # Close all backends
         for name, backend in self.storage_backends.items():

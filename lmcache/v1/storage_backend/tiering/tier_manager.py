@@ -1,20 +1,24 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 from enum import Enum, auto
+from functools import partial
 from threading import Event, Lock, Thread
 from time import time
-from typing import TYPE_CHECKING, Any, Callable, Optional, Sequence, cast
+from typing import TYPE_CHECKING, Callable, Optional, Sequence
 
 # First Party
 from lmcache.logging import init_logger
 from lmcache.utils import CacheEngineKey
 from lmcache.v1.storage_backend.tiering.hotness_policy import HotnessPolicy
 
+if TYPE_CHECKING:
+    from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
+    from lmcache.v1.storage_backend.local_disk_backend import LocalDiskBackend
+
 
 class Tier(Enum):
     CPU = auto()
     DISK = auto()
-    REMOTE = auto()
 
 PROMOTION_MARGIN = 0.05
 
@@ -63,9 +67,9 @@ class TierManager:
         self._state_lock = Lock()
         self._pressure_lock = Lock()
 
-        # Cached backend references (refreshed in setup_backend_hooks).
-        self._cpu_backend: Optional[object] = None
-        self._disk_backend: Optional[object] = None
+        # Backend references (set in setup_backend_hooks).
+        self._cpu_backend: "LocalCPUBackend"
+        self._disk_backend: "LocalDiskBackend"
 
     def start(self) -> None:
         """
@@ -108,18 +112,20 @@ class TierManager:
     # Hotness observation proxies — StorageManager delegates here
     # ------------------------------------------------------------------
 
-    def observe_store(self, keys: Sequence[CacheEngineKey]) -> None:
+    def observe_put(self, keys: Sequence[CacheEngineKey]) -> None:
         now = time()
         for prefix_pos, key in enumerate(keys):
-            self.hotness_policy.observe_store(key, prefix_pos, now=now)
+            self.hotness_policy.observe_put(key, prefix_pos, now=now)
 
-    def on_hit(self, key: CacheEngineKey) -> None:
-        self.hotness_policy.on_hit(key)
+    def observe_get(self, key: CacheEngineKey) -> None:
+        now = time()
+        self.hotness_policy.observe_get(key, now=now)
 
-    def mark_resident(
-        self, key: CacheEngineKey, tier: Tier, present: bool
-    ) -> None:
-        self.hotness_policy.mark_resident(key, tier, present)
+    def add_resident(self, key: CacheEngineKey, tier: Tier) -> None:
+        self.hotness_policy.add_resident(key, tier)
+
+    def remove_resident(self, key: CacheEngineKey, tier: Tier) -> None:
+        self.hotness_policy.remove_resident(key, tier)
 
     def clear_tier(self, tier: Tier) -> None:
         self.hotness_policy.clear_tier(tier)
@@ -133,15 +139,17 @@ class TierManager:
     # Backend name ↔ Tier mapping
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _backend_name_to_tier(backend_name: str) -> Optional[Tier]:
-        if backend_name == "LocalCPUBackend":
-            return Tier.CPU
-        if backend_name == "LocalDiskBackend":
-            return Tier.DISK
-        if backend_name == "RemoteBackend":
-            return Tier.REMOTE
-        return None
+    _BACKEND_TO_TIER = {
+        "LocalCPUBackend": Tier.CPU,
+        "LocalDiskBackend": Tier.DISK,
+    }
+
+    @classmethod
+    def _backend_name_to_tier(cls, backend_name: str) -> Optional[Tier]:
+        tier = cls._BACKEND_TO_TIER.get(backend_name)
+        if tier is None:
+            logger.warning("Unknown backend name for tiering: %s", backend_name)
+        return tier
 
     # ------------------------------------------------------------------
     # Callback factories for StorageManager put/evict flows
@@ -155,66 +163,60 @@ class TierManager:
             return None
 
         def _callback(key: CacheEngineKey) -> None:
-            self.mark_resident(key, tier, True)
+            self.add_resident(key, tier)
 
         return _callback
 
-    def make_internal_evict_callback(
-        self, backend_name: str
-    ) -> Optional[Callable[[CacheEngineKey], None]]:
-        tier = self._backend_name_to_tier(backend_name)
-        if tier is None:
-            return None
-
-        def _callback(key: CacheEngineKey) -> None:
-            self.mark_resident(key, tier, False)
-
-        return _callback
-
-    def mark_resident_by_name(
-        self, key: CacheEngineKey, backend_name: str, present: bool
+    def remove_resident_by_name(
+        self, key: CacheEngineKey, backend_name: str
     ) -> None:
         tier = self._backend_name_to_tier(backend_name)
         if tier is not None:
-            self.mark_resident(key, tier, present)
+            self.remove_resident(key, tier)
 
     # ------------------------------------------------------------------
     # Backend hook setup
     # ------------------------------------------------------------------
 
     def setup_backend_hooks(self) -> None:
-        self._cpu_backend = self.storage_manager.storage_backends.get(
-            "LocalCPUBackend"
-        )
-        self._disk_backend = self.storage_manager.storage_backends.get(
-            "LocalDiskBackend"
-        )
-        self._setup_cpu_pressure_handler()
-        self._setup_evict_callbacks()
+        backends = self.storage_manager.storage_backends
+        unsupported = set(backends.keys()) - {"LocalCPUBackend", "LocalDiskBackend"}
+        if unsupported:
+            raise RuntimeError(
+                f"TierManager only supports LocalCPUBackend and "
+                f"LocalDiskBackend, found unsupported: {unsupported}"
+            )
 
-    def teardown_cpu_pressure_handler(self) -> None:
-        from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
+        lcb = backends.get("LocalCPUBackend")
+        ldb = backends.get("LocalDiskBackend")
+        if not (isinstance(lcb, LocalCPUBackend) and isinstance(ldb, LocalDiskBackend)):
+            raise RuntimeError(
+                "TierManager requires LocalCPUBackend and LocalDiskBackend "
+                "to be present in StorageManager"
+            )
+        
+        self._cpu_backend = lcb
+        self._disk_backend = ldb
 
-        cpu = self.storage_manager.storage_backends.get("LocalCPUBackend")
-        if isinstance(cpu, LocalCPUBackend):
-            cpu.set_pressure_handler(None)
-
-    def _setup_cpu_pressure_handler(self) -> None:
-        from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
-
-        cpu = self.storage_manager.storage_backends.get("LocalCPUBackend")
-        if not isinstance(cpu, LocalCPUBackend):
-            return
-        cpu.set_pressure_handler(
+        # Setup CPU pressure handler
+        self._cpu_backend.set_pressure_handler(
             self.ensure_cpu_headroom, self.cpu_high_watermark
         )
 
-    def _setup_evict_callbacks(self) -> None:
-        for backend_name, backend in self.storage_manager.storage_backends.items():
-            if not hasattr(backend, "set_internal_evict_callback"):
-                continue
-            callback = self.make_internal_evict_callback(backend_name)
-            cast(Any, backend).set_internal_evict_callback(callback)
+        # Setup evict callbacks
+        self._cpu_backend.set_internal_evict_callback(
+            partial(self.remove_resident, tier=Tier.CPU)
+        )
+        self._disk_backend.set_internal_evict_callback(
+            partial(self.remove_resident, tier=Tier.DISK)
+        )
+
+    def teardown_backend_hooks(self, backend_name: Optional[str] = None) -> None:
+        if backend_name is None or backend_name == "LocalCPUBackend":
+            self._cpu_backend.set_pressure_handler(None)
+            self._cpu_backend.set_internal_evict_callback(None)
+        if backend_name is None or backend_name == "LocalDiskBackend":
+            self._disk_backend.set_internal_evict_callback(None)
 
     # ------------------------------------------------------------------
 
@@ -274,8 +276,8 @@ class TierManager:
                     continue
                 if disk_score < cpu_score:
                     continue
-                # TODO: if cpu_key has no disk replica, demote it first
-                # instead of skipping
+                # disk ⊇ CPU invariant: skip if disk copy is missing
+                # (should not happen under normal operation)
                 state = self.hotness_policy.get_state(cpu_key)
                 if state is None or Tier.DISK not in state.resident_tiers:
                     continue
@@ -326,7 +328,7 @@ class TierManager:
 
                 made_progress = False
                 for key, _score in candidates:
-                    if self.demote_key(key, blocking=True):
+                    if self.demote_key(key):
                         relieved = True
                         made_progress = True
                         usage_bytes = cpu_backend.get_usage_bytes()
@@ -381,96 +383,30 @@ class TierManager:
             self._release_memory_obj(memory_obj)
             return False
 
-        self.hotness_policy.mark_resident(victim_cpu_key, Tier.CPU, False)
+        self.hotness_policy.remove_resident(victim_cpu_key, Tier.CPU)
         return self._store_loaded_key_in_cpu(cpu_backend, disk_key, memory_obj)
 
-    def demote_key(self, key: CacheEngineKey, blocking: bool = False) -> bool:
+    def demote_key(self, key: CacheEngineKey) -> bool:
         """
-        Demote ``key`` from CPU into disk.
+        Demote key from CPU to disk.
 
-        If the key already exists on disk, the demotion completes immediately by
-        removing the CPU copy. Otherwise the key is first persisted to disk and
-        the CPU copy is removed only after the disk write completes.
-
-        Args:
-            key: Cache key to demote.
-            blocking: Whether to wait for the disk put to finish before
-                returning.
-
-        Returns:
-            True if the demotion completed or was successfully submitted,
-            otherwise False.
+        With the disk ⊇ CPU invariant (batched_put writes to both tiers),
+        demotion is a pure in-memory operation: just remove the CPU copy.
         """
         cpu_backend = self._cpu_backend
-        disk_backend = self._disk_backend
-        if cpu_backend is None or disk_backend is None:
-            return False
 
         state = self.hotness_policy.get_state(key)
         if state is None or Tier.CPU not in state.resident_tiers:
             return False
 
-        if hasattr(disk_backend, "contains") and disk_backend.contains(key):
-            if self._remove_cpu_if_evictable(cpu_backend, key):
-                self.hotness_policy.mark_resident(key, Tier.CPU, False)
-                self.hotness_policy.mark_resident(key, Tier.DISK, True)
-                return True
+        # Safety: skip if disk doesn't have it (disk-full edge case)
+        if Tier.DISK not in state.resident_tiers:
             return False
 
-        if not hasattr(cpu_backend, "get_blocking") or not hasattr(
-            disk_backend, "submit_put_task"
-        ):
-            return False
-
-        memory_obj = cpu_backend.get_blocking(key)
-        if memory_obj is None:
-            if not cpu_backend.contains(key):
-                self.hotness_policy.mark_resident(key, Tier.CPU, False)
-            return False
-
-        # Use a threading.Event to reliably synchronize callback completion
-        # when *blocking* is True, avoiding the race where we read
-        # ``demote_result`` before the callback has written it.
-        done_event = Event()
-        demote_result = [False]  # mutable container for callback to write to
-
-        def _complete_demote(completed_key: CacheEngineKey) -> None:
-            try:
-                self.hotness_policy.mark_resident(completed_key, Tier.DISK, True)
-                if self._remove_cpu_if_evictable(
-                    cpu_backend, completed_key
-                ) or not cpu_backend.contains(completed_key):
-                    self.hotness_policy.mark_resident(
-                        completed_key, Tier.CPU, False
-                    )
-                    demote_result[0] = True
-            finally:
-                memory_obj.ref_count_down()
-                done_event.set()
-
-        put_future = disk_backend.submit_put_task(
-            key,
-            memory_obj,
-            on_complete_callback=_complete_demote,
-        )
-        if put_future is None:
-            memory_obj.ref_count_down()
-            return False
-
-        if blocking:
-            try:
-                put_future.result()
-            except Exception:
-                logger.exception("Blocking demote failed for key %s", key)
-                # Only release if the callback hasn't already run.
-                if not done_event.is_set():
-                    memory_obj.ref_count_down()
-                return False
-            # Wait for the callback to finish (may already be done).
-            done_event.wait()
-            return demote_result[0]
-
-        return True
+        if self._remove_cpu_if_evictable(cpu_backend, key):
+            self.hotness_policy.remove_resident(key, Tier.CPU)
+            return True
+        return False
 
     def _run_loop(self) -> None:
         while not self._stop_event.is_set():
@@ -487,7 +423,7 @@ class TierManager:
     ) -> Optional[object]:
         memory_obj = disk_backend.get_blocking(key)
         if memory_obj is None:
-            self.hotness_policy.mark_resident(key, Tier.DISK, False)
+            self.hotness_policy.remove_resident(key, Tier.DISK)
             return None
         return memory_obj
 
@@ -501,7 +437,7 @@ class TierManager:
         cpu_backend.submit_put_task(key, memory_obj)
         promoted = already_in_cpu or cpu_backend.contains(key)
         if promoted and not already_in_cpu:
-            self.hotness_policy.mark_resident(key, Tier.CPU, True)
+            self.hotness_policy.add_resident(key, Tier.CPU)
 
         self._release_memory_obj(memory_obj)
         return promoted

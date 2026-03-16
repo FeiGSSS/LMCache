@@ -7,7 +7,7 @@ from enum import EnumType
 from math import exp, log1p
 from threading import RLock
 from time import time
-from typing import Hashable, Optional, Sequence
+from typing import Hashable, Optional
 
 # First Party
 from lmcache.utils import CacheEngineKey
@@ -67,7 +67,7 @@ class HotnessPolicy:
             self._states[key] = state
         return state
 
-    def observe_store(
+    def observe_put(
         self,
         key: CacheEngineKey,
         prefix_pos: int,
@@ -83,8 +83,9 @@ class HotnessPolicy:
                 self._get_or_create_state(key, timestamp, prefix_pos=prefix_pos)
                 return
             state.prefix_pos = min(state.prefix_pos, max(prefix_pos, 0))
+            state.last_hit_ts = timestamp
 
-    def on_hit(
+    def observe_get(
         self,
         key: CacheEngineKey,
         now: Optional[float] = None,
@@ -98,47 +99,42 @@ class HotnessPolicy:
             state.hit_count += 1
             state.last_hit_ts = timestamp
 
-    def batch_on_hit(
-        self,
-        keys: Sequence[CacheEngineKey],
-        now: Optional[float] = None,
-    ) -> None:
-        """
-        Record cache hits for multiple *keys* under a single lock acquisition.
-        """
-        timestamp = time() if now is None else now
-        with self._lock:
-            for key in keys:
-                state = self._get_or_create_state(key, timestamp)
-                state.hit_count += 1
-                state.last_hit_ts = timestamp
-
-    def mark_resident(
+    def add_resident(
         self,
         key: CacheEngineKey,
         tier: Hashable,
-        present: bool,
     ) -> None:
         """
-        Update tier residency for ``key`` after a successful action.
+        Mark ``key`` as resident in ``tier``.
 
-        If ``present`` is True and no state exists yet, a new state is created.
-        If ``present`` is False and no state exists, this is a no-op.
+        Raises ``KeyError`` if *key* has no hotness state — callers must
+        ensure ``observe_put`` was called first.
         """
         with self._lock:
             state = self._states.get(key)
             if state is None:
-                if not present:
-                    # Removing residency for an unknown key is a no-op.
-                    self._tier_keys[tier].discard(key)
-                    return
-                state = self._get_or_create_state(key, time())
+                raise KeyError(
+                    f"add_resident called for unknown key {key}"
+                )
+            state.resident_tiers.add(tier)
+            self._tier_keys[tier].add(key)
 
-            if present:
-                state.resident_tiers.add(tier)
-                self._tier_keys[tier].add(key)
+    def remove_resident(
+        self,
+        key: CacheEngineKey,
+        tier: Hashable,
+    ) -> None:
+        """
+        Remove ``key`` from ``tier``. If ``key`` has no remaining tiers,
+        its hotness state is deleted.
+
+        No-op if *key* has no hotness state.
+        """
+        with self._lock:
+            state = self._states.get(key)
+            if state is None:
+                self._tier_keys[tier].discard(key)
                 return
-
             state.resident_tiers.discard(tier)
             self._tier_keys[tier].discard(key)
             if not state.resident_tiers:
@@ -149,11 +145,8 @@ class HotnessPolicy:
         Remove residency for all keys in ``tier``.
         """
         with self._lock:
-            keys = list(self._tier_keys[tier])
-            for key in keys:
-                state = self._states.get(key)
-                if state is None:
-                    continue
+            for key in self._tier_keys[tier]:
+                state = self._states[key]
                 state.resident_tiers.discard(tier)
                 if not state.resident_tiers:
                     self._states.pop(key, None)

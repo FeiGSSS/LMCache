@@ -76,9 +76,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
         self.cpu_lock = threading.Lock()
         self._pressure_handler: Optional[Callable[[], bool]] = None
         self._pressure_high_watermark: Optional[float] = None
-        self._pressure_handler_lock = threading.Lock()
         self._internal_evict_callback: Optional[Callable[[CacheEngineKey], None]] = None
-        self._internal_evict_callback_lock = threading.Lock()
 
         self.stats_monitor = LMCStatsMonitor.GetOrCreate()
 
@@ -153,9 +151,8 @@ class LocalCPUBackend(AllocatorBackendInterface):
             high_watermark: Optional CPU usage ratio that triggers the handler
                 immediately after an admit when exceeded.
         """
-        with self._pressure_handler_lock:
-            self._pressure_handler = handler
-            self._pressure_high_watermark = high_watermark
+        self._pressure_handler = handler
+        self._pressure_high_watermark = high_watermark
 
     def set_internal_evict_callback(
         self,
@@ -168,8 +165,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
             callback: Invoked after a key is evicted internally by this backend.
                 ``None`` clears the current callback.
         """
-        with self._internal_evict_callback_lock:
-            self._internal_evict_callback = callback
+        self._internal_evict_callback = callback
 
     def exists_in_put_tasks(self, key: CacheEngineKey) -> bool:
         """
@@ -903,9 +899,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
         self.clear()
 
     def _maybe_relieve_pressure(self) -> bool:
-        with self._pressure_handler_lock:
-            handler = self._pressure_handler
-
+        handler = self._pressure_handler
         if handler is None:
             return False
 
@@ -916,10 +910,8 @@ class LocalCPUBackend(AllocatorBackendInterface):
             return False
 
     def _maybe_relieve_post_admit_pressure(self) -> None:
-        with self._pressure_handler_lock:
-            handler = self._pressure_handler
-            high_watermark = self._pressure_high_watermark
-
+        handler = self._pressure_handler
+        high_watermark = self._pressure_high_watermark
         if handler is None or high_watermark is None:
             return
 
@@ -937,9 +929,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
             logger.exception("Post-admit CPU pressure handler failed")
 
     def _notify_internal_evict(self, key: CacheEngineKey) -> None:
-        with self._internal_evict_callback_lock:
-            callback = self._internal_evict_callback
-
+        callback = self._internal_evict_callback
         if callback is None:
             return
 

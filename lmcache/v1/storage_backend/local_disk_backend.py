@@ -128,7 +128,6 @@ class LocalDiskBackend(StorageBackendInterface):
 
         self.use_local_cpu = config.local_cpu
         self._internal_evict_callback: Optional[Callable[[CacheEngineKey], None]] = None
-        self._internal_evict_callback_lock = threading.Lock()
 
         # Block size (for file system I/O)
         stat = os.statvfs(self.path)
@@ -210,8 +209,7 @@ class LocalDiskBackend(StorageBackendInterface):
             callback: Invoked after a key is evicted internally by this backend.
                 ``None`` clears the current callback.
         """
-        with self._internal_evict_callback_lock:
-            self._internal_evict_callback = callback
+        self._internal_evict_callback = callback
 
     def pin(
         self,
@@ -338,6 +336,9 @@ class LocalDiskBackend(StorageBackendInterface):
         all_evict_keys = []
         evict_success = True
         with self.disk_lock:
+            # TODO: Disk LRU eviction may evict keys that are still CPU-resident,
+            # breaking the disk ⊇ CPU invariant. If this happens, demote_key will
+            # skip these keys. Consider adding an eviction filter to prevent this.
             while self.current_cache_size + required_size > self.max_cache_size:
                 evict_keys = self.cache_policy.get_evict_candidates(
                     self.dict, num_candidates=1
@@ -680,9 +681,7 @@ class LocalDiskBackend(StorageBackendInterface):
         self.disk_worker.close()
 
     def _notify_internal_evict(self, key: CacheEngineKey) -> None:
-        with self._internal_evict_callback_lock:
-            callback = self._internal_evict_callback
-
+        callback = self._internal_evict_callback
         if callback is None:
             return
 
