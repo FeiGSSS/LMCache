@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
 from threading import Event, Lock, Thread
-from typing import TYPE_CHECKING, Optional, cast
+from time import time
+from typing import TYPE_CHECKING, Optional, Sequence, cast
 
 # First Party
 from lmcache.logging import init_logger
@@ -36,14 +37,14 @@ class TierManager:
     def __init__(
         self,
         storage_manager: "StorageManager",
-        hotness_policy: HotnessPolicy,
+        hotness_policy: Optional[HotnessPolicy] = None,
         interval_secs: Optional[float] = None,
         cpu_high_watermark: float = DEFAULT_CPU_HIGH_WATERMARK,
         cpu_low_watermark: float = DEFAULT_CPU_LOW_WATERMARK,
         max_actions_per_tick: int = DEFAULT_MAX_ACTIONS_PER_TICK,
     ) -> None:
         self.storage_manager = storage_manager
-        self.hotness_policy = hotness_policy
+        self.hotness_policy = hotness_policy or HotnessPolicy()
         self.interval_secs = (
             DEFAULT_TIER_MANAGER_INTERVAL_SECS
             if interval_secs is None
@@ -98,6 +99,28 @@ class TierManager:
         """
         with self._state_lock:
             return self._thread is not None and self._thread.is_alive()
+
+    # ------------------------------------------------------------------
+    # Hotness observation proxies — StorageManager delegates here
+    # ------------------------------------------------------------------
+
+    def observe_store(self, keys: Sequence[CacheEngineKey]) -> None:
+        now = time()
+        for prefix_pos, key in enumerate(keys):
+            self.hotness_policy.observe_store(key, prefix_pos, now=now)
+
+    def on_hit(self, key: CacheEngineKey) -> None:
+        self.hotness_policy.on_hit(key)
+
+    def mark_resident(
+        self, key: CacheEngineKey, tier: Tier, present: bool
+    ) -> None:
+        self.hotness_policy.mark_resident(key, tier, present)
+
+    def clear_tier(self, tier: Tier) -> None:
+        self.hotness_policy.clear_tier(tier)
+
+    # ------------------------------------------------------------------
 
     def run_once(self) -> None:
         """

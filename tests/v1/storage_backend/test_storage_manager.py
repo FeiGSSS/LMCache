@@ -35,7 +35,8 @@ from lmcache.v1.event_manager import EventManager, EventType
 from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
 from lmcache.v1.storage_backend import tier_manager as tier_manager_module
-from lmcache.v1.storage_backend.hotness_policy import HotnessPolicy, Tier
+from lmcache.v1.storage_backend.hotness_policy import Tier
+from lmcache.v1.storage_backend.tier_manager import TierManager
 from lmcache.v1.storage_backend.storage_manager import StorageManager
 from tests.v1.utils import dumb_cache_engine_key
 
@@ -464,14 +465,14 @@ def test_get_non_blocking_updates_hotness(storage_manager):
             return future
 
     key = dumb_cache_engine_key(801)
-    storage_manager.hotness_policy = HotnessPolicy()
+    storage_manager.tier_manager = TierManager(storage_manager)
     storage_manager.storage_backends = OrderedDict([("FakeBackend", FakeBackend())])
 
     task = storage_manager.get_non_blocking(key, location="FakeBackend")
     assert task is not None
     _ = task.result()
 
-    state = storage_manager.hotness_policy.get_state(key)
+    state = storage_manager.tier_manager.hotness_policy.get_state(key)
     assert state is not None
     assert state.hit_count == 1
 
@@ -484,7 +485,7 @@ def test_layerwise_batched_get_updates_hotness(storage_manager):
 
     key1 = dumb_cache_engine_key(811)
     key2 = dumb_cache_engine_key(812)
-    storage_manager.hotness_policy = HotnessPolicy()
+    storage_manager.tier_manager = TierManager(storage_manager)
     storage_manager.storage_backends = OrderedDict([("FakeBackend", FakeBackend())])
 
     futures = list(
@@ -496,8 +497,8 @@ def test_layerwise_batched_get_updates_hotness(storage_manager):
     assert len(futures) == 1
     _ = futures[0].result()
 
-    state1 = storage_manager.hotness_policy.get_state(key1)
-    state2 = storage_manager.hotness_policy.get_state(key2)
+    state1 = storage_manager.tier_manager.hotness_policy.get_state(key1)
+    state2 = storage_manager.tier_manager.hotness_policy.get_state(key2)
     assert state1 is not None
     assert state2 is not None
     assert state1.hit_count == 1
@@ -509,7 +510,7 @@ def test_prefetch_callback_with_keyed_results_updates_hotness(storage_manager):
     key2 = dumb_cache_engine_key(822)
     obj1 = MockMemoryObj(1)
     obj2 = MockMemoryObj(2)
-    storage_manager.hotness_policy = HotnessPolicy()
+    storage_manager.tier_manager = TierManager(storage_manager)
 
     cum_chunk_lengths_total = [0, 256, 512]
     tier_expected_chunks = [2]
@@ -531,8 +532,8 @@ def test_prefetch_callback_with_keyed_results_updates_hotness(storage_manager):
     )
     loop.close()
 
-    state1 = storage_manager.hotness_policy.get_state(key1)
-    state2 = storage_manager.hotness_policy.get_state(key2)
+    state1 = storage_manager.tier_manager.hotness_policy.get_state(key1)
+    state2 = storage_manager.tier_manager.hotness_policy.get_state(key2)
     assert state1 is not None
     assert state2 is not None
     assert state1.hit_count == 1
@@ -571,7 +572,7 @@ def test_batched_get_stitches_prefix_hits_across_backends(storage_manager):
     objs = [MockMemoryObj(i) for i in range(10)]
     cpu_backend = FakeCPUBackend(keys, objs)
     disk_backend = FakeDiskBackend(keys, objs)
-    storage_manager.hotness_policy = HotnessPolicy()
+    storage_manager.tier_manager = TierManager(storage_manager)
     storage_manager.storage_backends = OrderedDict(
         [
             ("LocalCPUBackend", cpu_backend),
@@ -585,7 +586,7 @@ def test_batched_get_stitches_prefix_hits_across_backends(storage_manager):
     assert cpu_backend.calls == [keys]
     assert disk_backend.calls == [keys[5:]]
     for key in keys:
-        state = storage_manager.hotness_policy.get_state(key)
+        state = storage_manager.tier_manager.hotness_policy.get_state(key)
         assert state is not None
         assert state.hit_count == 1
 
@@ -623,7 +624,7 @@ def test_batched_get_writes_back_only_non_cpu_suffix(storage_manager):
 
     keys = [dumb_cache_engine_key(860 + i) for i in range(4)]
     objs = [MockMemoryObj(i) for i in range(4)]
-    storage_manager.hotness_policy = HotnessPolicy()
+    storage_manager.tier_manager = TierManager(storage_manager)
     storage_manager.storage_backends = OrderedDict(
         [
             ("LocalCPUBackend", FakeCPUBackend()),
@@ -637,7 +638,7 @@ def test_batched_get_writes_back_only_non_cpu_suffix(storage_manager):
     assert results == objs
     assert storage_manager.local_cpu_backend.calls == [(keys, objs)]
     for key in keys:
-        state = storage_manager.hotness_policy.get_state(key)
+        state = storage_manager.tier_manager.hotness_policy.get_state(key)
         assert state is not None
         assert Tier.CPU in state.resident_tiers
 
@@ -654,9 +655,9 @@ def test_clear_updates_hotness_tiers_without_reconcile(storage_manager):
     cpu_key = dumb_cache_engine_key(831)
     disk_key = dumb_cache_engine_key(832)
 
-    storage_manager.hotness_policy = HotnessPolicy()
-    storage_manager.hotness_policy.mark_resident(cpu_key, Tier.CPU, True)
-    storage_manager.hotness_policy.mark_resident(disk_key, Tier.DISK, True)
+    storage_manager.tier_manager = TierManager(storage_manager)
+    storage_manager.tier_manager.hotness_policy.mark_resident(cpu_key, Tier.CPU, True)
+    storage_manager.tier_manager.hotness_policy.mark_resident(disk_key, Tier.DISK, True)
     cpu_backend = FakeBackend()
     disk_backend = FakeBackend()
 
@@ -669,8 +670,8 @@ def test_clear_updates_hotness_tiers_without_reconcile(storage_manager):
 
     assert storage_manager.clear(["LocalCPUBackend"]) == 1
 
-    cpu_state = storage_manager.hotness_policy.get_state(cpu_key)
-    disk_state = storage_manager.hotness_policy.get_state(disk_key)
+    cpu_state = storage_manager.tier_manager.hotness_policy.get_state(cpu_key)
+    disk_state = storage_manager.tier_manager.hotness_policy.get_state(disk_key)
 
     assert cpu_state is None
     assert disk_state is not None

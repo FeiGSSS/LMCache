@@ -19,7 +19,6 @@ from typing import (
 import asyncio
 import functools
 import threading
-from time import time
 
 # Third Party
 import torch
@@ -44,7 +43,7 @@ from lmcache.v1.storage_backend.abstract_backend import (
     AllocatorBackendInterface,
     StorageBackendInterface,
 )
-from lmcache.v1.storage_backend.hotness_policy import HotnessPolicy, Tier
+from lmcache.v1.storage_backend.hotness_policy import Tier
 from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
 from lmcache.v1.storage_backend.tier_manager import TierManager
 
@@ -243,7 +242,6 @@ class StorageManager:
         self.storage_backends: OrderedDict[str, StorageBackendInterface] = OrderedDict()
         self.manager_lock = threading.Lock()
         self.lmcache_worker = lmcache_worker
-        self.hotness_policy: Optional[HotnessPolicy] = None
         self.tier_manager: Optional[TierManager] = None
         self.local_cpu_backend: Optional[LocalCPUBackend] = None
 
@@ -291,8 +289,7 @@ class StorageManager:
             self.async_serializer = AsyncSingleSerializer(self.loop)
 
         if self._is_tiering_enabled():
-            self.hotness_policy = HotnessPolicy()
-            self.tier_manager = TierManager(self, self.hotness_policy)
+            self.tier_manager = TierManager(self)
             self._refresh_cpu_pressure_handler()
             self._refresh_tiering_backend_hooks()
             self.tier_manager.start()
@@ -341,11 +338,9 @@ class StorageManager:
         return None
 
     def _record_store_observations(self, keys: Sequence[CacheEngineKey]) -> None:
-        if self.hotness_policy is None:
+        if self.tier_manager is None:
             return
-        now = time()
-        for prefix_pos, key in enumerate(keys):
-            self.hotness_policy.observe_store(key, prefix_pos, now=now)
+        self.tier_manager.observe_store(keys)
 
     def _mark_resident(
         self,
@@ -353,16 +348,16 @@ class StorageManager:
         tier: Optional[Tier],
         present: bool,
     ) -> None:
-        if self.hotness_policy is None or tier is None:
+        if self.tier_manager is None or tier is None:
             return
-        self.hotness_policy.mark_resident(key, tier, present)
+        self.tier_manager.mark_resident(key, tier, present)
 
     def _make_put_complete_callback(
         self,
         backend_name: str,
     ) -> Optional[Callable[[CacheEngineKey], None]]:
         tier = self._backend_name_to_tier(backend_name)
-        if tier is None or self.hotness_policy is None:
+        if tier is None or self.tier_manager is None:
             return None
 
         def _callback(key: CacheEngineKey) -> None:
@@ -371,16 +366,16 @@ class StorageManager:
         return _callback
 
     def _record_hit(self, key: CacheEngineKey) -> None:
-        if self.hotness_policy is None:
+        if self.tier_manager is None:
             return
-        self.hotness_policy.on_hit(key)
+        self.tier_manager.on_hit(key)
 
     def _record_async_single_hit(
         self,
         key: CacheEngineKey,
         task: Future,
     ) -> None:
-        if self.hotness_policy is None:
+        if self.tier_manager is None:
             return
 
         def _done(done_task: Future) -> None:
@@ -398,7 +393,7 @@ class StorageManager:
         keys: Sequence[CacheEngineKey],
         task: Future,
     ) -> None:
-        if self.hotness_policy is None:
+        if self.tier_manager is None:
             return
 
         def _done(done_task: Future) -> None:
@@ -434,7 +429,7 @@ class StorageManager:
         backend_name: str,
     ) -> Optional[Callable[[CacheEngineKey], None]]:
         tier = self._backend_name_to_tier(backend_name)
-        if tier is None or self.hotness_policy is None:
+        if tier is None or self.tier_manager is None:
             return None
 
         def _callback(key: CacheEngineKey) -> None:
@@ -465,13 +460,13 @@ class StorageManager:
             cast(Any, backend).set_internal_evict_callback(callback)
 
     def _clear_tier(self, backend_name: str) -> None:
-        if self.hotness_policy is None:
+        if self.tier_manager is None:
             return
 
         tier = self._backend_name_to_tier(backend_name)
         if tier is None:
             return
-        self.hotness_policy.clear_tier(tier)
+        self.tier_manager.clear_tier(tier)
 
     def _is_tiering_enabled(self) -> bool:
         return self.config.enable_tiering
