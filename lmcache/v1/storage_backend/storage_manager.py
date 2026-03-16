@@ -331,45 +331,6 @@ class StorageManager:
             return
         self.tier_manager.on_hit(key)
 
-    def _record_async_single_hit(
-        self,
-        key: CacheEngineKey,
-        task: Future,
-    ) -> None:
-        if self.tier_manager is None:
-            return
-
-        def _done(done_task: Future) -> None:
-            try:
-                memory_obj = done_task.result()
-            except Exception:
-                return
-            if memory_obj is not None:
-                self._record_hit(key)
-
-        task.add_done_callback(_done)
-
-    def _record_async_batched_hits(
-        self,
-        keys: Sequence[CacheEngineKey],
-        task: Future,
-    ) -> None:
-        if self.tier_manager is None:
-            return
-
-        def _done(done_task: Future) -> None:
-            try:
-                memory_objs = done_task.result()
-            except Exception:
-                return
-            if memory_objs is None:
-                return
-            for key, memory_obj in zip(keys, memory_objs, strict=False):
-                if memory_obj is not None:
-                    self._record_hit(key)
-
-        task.add_done_callback(_done)
-
     def _get_tier_put_callback(
         self, backend_name: str
     ) -> Optional[Callable[[CacheEngineKey], None]]:
@@ -552,6 +513,11 @@ class StorageManager:
         """
         Non-blocking function to get the memory object from the storages.
         """
+        if self.tier_manager is not None:
+            raise NotImplementedError(
+                "get_non_blocking is not supported with tiering enabled"
+            )
+
         # TODO (Jiayi): incorporate prefetching here
 
         # Search all backends for non-blocking get
@@ -559,7 +525,6 @@ class StorageManager:
             # NOTE(Jiayi): bypass the allocator for now
             task = backend.get_non_blocking(key)
             if task:
-                self._record_async_single_hit(key, task)
                 # TODO (Jiayi): add write-back logic here
                 return task
         return None
@@ -629,6 +594,11 @@ class StorageManager:
 
         :return: A generator that yields a future for each layer.
         """
+        if self.tier_manager is not None:
+            raise NotImplementedError(
+                "layerwise_batched_get is not supported with tiering enabled"
+            )
+
         if location is None:
             location = "LocalCPUBackend"
         for keys_multi_chunk in keys:
@@ -637,7 +607,6 @@ class StorageManager:
             # TODO(Jiayi): need to make async loading and layerwise compatible
             coro = backend.batched_get_non_blocking("fake_lookup_id", keys_multi_chunk)
             task = asyncio.run_coroutine_threadsafe(coro, self.loop)
-            self._record_async_batched_hits(keys_multi_chunk, task)
             yield task
 
     def prefetch_single_done_callback(
@@ -719,18 +688,12 @@ class StorageManager:
             expected_chunks = tier_expected_chunks[tier_idx]
             total_retrieved_chunks += actual_chunks
 
-            for entry in tier_result:
-                if isinstance(entry, tuple):
-                    key, _ = entry
-                    self._record_hit(key)
-
             # If a tier retrieved fewer chunks than expected, we stop counting
             # because subsequent chunks are not contiguous
             if actual_chunks < expected_chunks:
                 # Release all chunks in subsequent tiers since they won't be used
                 for subsequent_tier in res[tier_idx + 1 :]:
-                    for entry in subsequent_tier:
-                        mem_obj = entry[1] if isinstance(entry, tuple) else entry
+                    for mem_obj in subsequent_tier:
                         mem_obj.ref_count_down()
                 break
 
@@ -768,6 +731,10 @@ class StorageManager:
         "LocalDiskBackend"] for now. If None, search in all backends.
         :param bool pin: Whether to pin the keys.
         """
+        if self.tier_manager is not None:
+            raise NotImplementedError(
+                "async_lookup_and_prefetch is not supported with tiering enabled"
+            )
 
         # NOTE(Jiayi): Currently, the retrieval pattern is always
         # prefix-based. That is, we retrieve 0-t1 tokens from backend 1
