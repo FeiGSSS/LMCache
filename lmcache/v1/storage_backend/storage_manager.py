@@ -43,7 +43,7 @@ from lmcache.v1.storage_backend.abstract_backend import (
     AllocatorBackendInterface,
     StorageBackendInterface,
 )
-from lmcache.v1.storage_backend.tier_defs import Tier
+from lmcache.v1.storage_backend.tier_manager import Tier
 from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
 from lmcache.v1.storage_backend.tier_manager import TierManager
 

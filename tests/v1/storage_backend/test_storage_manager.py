@@ -35,7 +35,7 @@ from lmcache.v1.event_manager import EventManager, EventType
 from lmcache.v1.metadata import LMCacheMetadata
 from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
 from lmcache.v1.storage_backend import tier_manager as tier_manager_module
-from lmcache.v1.storage_backend.tier_defs import Tier
+from lmcache.v1.storage_backend.tier_manager import Tier
 from lmcache.v1.storage_backend.tier_manager import TierManager
 from lmcache.v1.storage_backend.storage_manager import StorageManager
 from tests.v1.utils import dumb_cache_engine_key

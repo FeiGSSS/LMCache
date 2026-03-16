@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
+from enum import Enum, auto
 from threading import Event, Lock, Thread
 from time import time
 from typing import TYPE_CHECKING, Optional, Sequence, cast
@@ -7,8 +8,18 @@ from typing import TYPE_CHECKING, Optional, Sequence, cast
 # First Party
 from lmcache.logging import init_logger
 from lmcache.utils import CacheEngineKey
-from lmcache.v1.storage_backend.hotness_policy import HotnessPolicy
-from lmcache.v1.storage_backend.tier_defs import Tier
+
+
+class Tier(Enum):
+    CPU = auto()
+    DISK = auto()
+    REMOTE = auto()
+
+
+# NOTE: Tier must be defined before this import.  HotnessPolicy
+# references Tier at module level; Python resolves it from the
+# partially-loaded tier_manager namespace, which already contains Tier.
+from lmcache.v1.storage_backend.hotness_policy import HotnessPolicy  # noqa: E402
 
 PROMOTION_MARGIN = 0.05
 

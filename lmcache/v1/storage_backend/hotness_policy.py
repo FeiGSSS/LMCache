@@ -10,7 +10,7 @@ from typing import Optional, Sequence
 
 # First Party
 from lmcache.utils import CacheEngineKey
-from lmcache.v1.storage_backend.tier_defs import Tier
+from lmcache.v1.storage_backend.tier_manager import Tier
 
 HIT_CAP = 32
 PREFIX_DECAY = 16.0
