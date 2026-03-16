@@ -2,15 +2,15 @@
 # Standard
 import copy
 import heapq
+from collections import defaultdict
 from dataclasses import dataclass, field
 from math import exp, log1p
 from threading import RLock
 from time import time
-from typing import Optional, Sequence
+from typing import Hashable, Optional, Sequence
 
 # First Party
 from lmcache.utils import CacheEngineKey
-from lmcache.v1.storage_backend.tier_manager import Tier
 
 HIT_CAP = 32
 PREFIX_DECAY = 16.0
@@ -27,21 +27,20 @@ class HotnessState:
     hit_count: int
     insert_ts: float
     last_hit_ts: float
-    resident_tiers: set[Tier] = field(default_factory=set)
+    resident_tiers: set = field(default_factory=set)
 
 
 class HotnessPolicy:
     """
     Global hotness tracker for cross-tier cache management.
+
+    Tier values are opaque hashable keys — the policy does not depend on
+    any specific Tier enum.
     """
 
     def __init__(self) -> None:
         self._states: dict[CacheEngineKey, HotnessState] = {}
-        self._tier_keys: dict[Tier, set[CacheEngineKey]] = {
-            Tier.CPU: set(),
-            Tier.DISK: set(),
-            Tier.REMOTE: set(),
-        }
+        self._tier_keys: defaultdict[Hashable, set[CacheEngineKey]] = defaultdict(set)
         self._lock = RLock()
 
     def _get_or_create_state(
@@ -115,7 +114,7 @@ class HotnessPolicy:
     def mark_resident(
         self,
         key: CacheEngineKey,
-        tier: Tier,
+        tier: Hashable,
         present: bool,
     ) -> None:
         """
@@ -143,7 +142,7 @@ class HotnessPolicy:
             if not state.resident_tiers:
                 self._states.pop(key, None)
 
-    def clear_tier(self, tier: Tier) -> None:
+    def clear_tier(self, tier: Hashable) -> None:
         """
         Remove residency for all keys in ``tier``.
         """
@@ -189,7 +188,7 @@ class HotnessPolicy:
                 return 0.0
             return self._compute_score(state, timestamp)
 
-    def get_keys_in_tier(self, tier: Tier) -> list[CacheEngineKey]:
+    def get_keys_in_tier(self, tier: Hashable) -> list[CacheEngineKey]:
         """
         Return a snapshot of keys currently resident in ``tier``.
         """
@@ -198,7 +197,7 @@ class HotnessPolicy:
 
     def select_coldest(
         self,
-        tier: Tier,
+        tier: Hashable,
         limit: int,
         exclude: Optional[set[CacheEngineKey]] = None,
         now: Optional[float] = None,
@@ -225,9 +224,9 @@ class HotnessPolicy:
 
     def select_hottest(
         self,
-        tier: Tier,
+        tier: Hashable,
         limit: int,
-        require_absent_in: Optional[Tier] = None,
+        require_absent_in: Optional[Hashable] = None,
         exclude: Optional[set[CacheEngineKey]] = None,
         now: Optional[float] = None,
     ) -> list[CacheEngineKey]:
