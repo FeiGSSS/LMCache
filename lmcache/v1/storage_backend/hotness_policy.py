@@ -203,26 +203,22 @@ class HotnessPolicy:
         limit: int,
         exclude: Optional[set[CacheEngineKey]] = None,
         now: Optional[float] = None,
-    ) -> list[CacheEngineKey]:
+    ) -> list[tuple[CacheEngineKey, float]]:
         """
         Select the coldest keys currently resident in ``tier``.
 
-        Uses ``heapq.nsmallest`` to avoid a full sort — O(n log limit)
-        instead of O(n log n).
+        Returns a list of ``(key, score)`` pairs sorted coldest-first.
+        Uses ``heapq.nsmallest`` — O(n log limit) instead of O(n log n).
         """
         timestamp = time() if now is None else now
         excluded = exclude or set()
         with self._lock:
-            candidates = (
-                key
+            scored = [
+                (key, self._compute_score(self._states[key], timestamp))
                 for key in self._tier_keys[tier]
                 if key not in excluded and key in self._states
-            )
-            return heapq.nsmallest(
-                limit,
-                candidates,
-                key=lambda k: self._compute_score(self._states[k], timestamp),
-            )
+            ]
+            return heapq.nsmallest(limit, scored, key=lambda p: p[1])
 
     def select_hottest(
         self,
@@ -231,17 +227,17 @@ class HotnessPolicy:
         require_absent_in: Optional[Hashable] = None,
         exclude: Optional[set[CacheEngineKey]] = None,
         now: Optional[float] = None,
-    ) -> list[CacheEngineKey]:
+    ) -> list[tuple[CacheEngineKey, float]]:
         """
         Select the hottest keys currently resident in ``tier``.
 
-        Uses ``heapq.nlargest`` to avoid a full sort — O(n log limit)
-        instead of O(n log n).
+        Returns a list of ``(key, score)`` pairs sorted hottest-first.
+        Uses ``heapq.nlargest`` — O(n log limit) instead of O(n log n).
         """
         timestamp = time() if now is None else now
         excluded = exclude or set()
         with self._lock:
-            candidates = []
+            scored = []
             for key in self._tier_keys[tier]:
                 if key in excluded or key not in self._states:
                     continue
@@ -251,20 +247,10 @@ class HotnessPolicy:
                     and require_absent_in in state.resident_tiers
                 ):
                     continue
-                candidates.append(key)
-            return heapq.nlargest(
-                limit,
-                candidates,
-                key=lambda k: self._compute_score(self._states[k], timestamp),
-            )
-
-    def refresh(self) -> None:
-        """
-        Refresh internal aging state.
-
-        Hotness currently uses lazy age computation, so this is a no-op.
-        """
-        return None
+                scored.append(
+                    (key, self._compute_score(state, timestamp))
+                )
+            return heapq.nlargest(limit, scored, key=lambda p: p[1])
 
     def _compute_score(self, state: HotnessState, now: float) -> float:
         prefix_score = exp(-state.prefix_pos / PREFIX_DECAY)

@@ -63,9 +63,9 @@ class TierManager:
         self._state_lock = Lock()
         self._pressure_lock = Lock()
 
-        # Cached backend references (populated lazily).
-        self._cached_cpu_backend: Optional[object] = None
-        self._cached_disk_backend: Optional[object] = None
+        # Cached backend references (refreshed in setup_backend_hooks).
+        self._cpu_backend: Optional[object] = None
+        self._disk_backend: Optional[object] = None
 
     def start(self) -> None:
         """
@@ -183,6 +183,12 @@ class TierManager:
     # ------------------------------------------------------------------
 
     def setup_backend_hooks(self) -> None:
+        self._cpu_backend = self.storage_manager.storage_backends.get(
+            "LocalCPUBackend"
+        )
+        self._disk_backend = self.storage_manager.storage_backends.get(
+            "LocalDiskBackend"
+        )
         self._setup_cpu_pressure_handler()
         self._setup_evict_callbacks()
 
@@ -217,7 +223,6 @@ class TierManager:
         Run one promotion-management iteration.
         """
         with self._pressure_lock:
-            self.hotness_policy.refresh()
             self._maybe_replace_promote_disk_locked()
 
     def maybe_replace_promote_disk(self) -> None:
@@ -228,14 +233,17 @@ class TierManager:
             self._maybe_replace_promote_disk_locked()
 
     def _maybe_replace_promote_disk_locked(self) -> None:
-        cpu_backend = self._get_cpu_backend()
+        cpu_backend = self._cpu_backend
         if cpu_backend is None:
             return
+
+        now = time()
 
         disk_candidates = self.hotness_policy.select_hottest(
             Tier.DISK,
             limit=self.max_actions_per_tick,
             require_absent_in=Tier.CPU,
+            now=now,
         )
         if not disk_candidates:
             return
@@ -243,24 +251,33 @@ class TierManager:
         cpu_candidates = self.hotness_policy.select_coldest(
             Tier.CPU,
             limit=self.max_actions_per_tick,
+            now=now,
         )
         if not cpu_candidates:
             return
 
+        logger.debug(
+            "Promotion candidates: disk_hot=%d cpu_cold=%d",
+            len(disk_candidates),
+            len(cpu_candidates),
+        )
+
         used_cpu_keys: set[CacheEngineKey] = set()
 
-        for disk_key in disk_candidates:
-            disk_score = self.hotness_policy.get_score(disk_key)
+        for disk_key, disk_score in disk_candidates:
             victim_key: Optional[CacheEngineKey] = None
 
-            for cpu_key in cpu_candidates:
+            # Iterate hottest-first so we replace the warmest eligible
+            # CPU key, leaving colder ones for less-hot disk keys.
+            for cpu_key, cpu_score in reversed(cpu_candidates):
                 if cpu_key in used_cpu_keys:
                     continue
+                if disk_score < cpu_score:
+                    continue
+                # TODO: if cpu_key has no disk replica, demote it first
+                # instead of skipping
                 state = self.hotness_policy.get_state(cpu_key)
                 if state is None or Tier.DISK not in state.resident_tiers:
-                    continue
-                cpu_score = self.hotness_policy.get_score(cpu_key)
-                if disk_score <= cpu_score + PROMOTION_MARGIN:
                     continue
                 victim_key = cpu_key
                 break
@@ -282,8 +299,8 @@ class TierManager:
         Returns:
             True if any CPU headroom was created, otherwise False.
         """
-        cpu_backend = self._get_cpu_backend()
-        disk_backend = self._get_disk_backend()
+        cpu_backend = self._cpu_backend
+        disk_backend = self._disk_backend
         if cpu_backend is None or disk_backend is None:
             return False
 
@@ -308,7 +325,7 @@ class TierManager:
                     break
 
                 made_progress = False
-                for key in candidates:
+                for key, _score in candidates:
                     if self.demote_key(key, blocking=True):
                         relieved = True
                         made_progress = True
@@ -325,8 +342,8 @@ class TierManager:
         """
         Promote ``key`` from disk into CPU.
         """
-        cpu_backend = self._get_cpu_backend()
-        disk_backend = self._get_disk_backend()
+        cpu_backend = self._cpu_backend
+        disk_backend = self._disk_backend
         if cpu_backend is None or disk_backend is None:
             return False
 
@@ -347,8 +364,8 @@ class TierManager:
         The current implementation only replaces victims that already have a
         disk copy so the victim can be removed from CPU immediately.
         """
-        cpu_backend = self._get_cpu_backend()
-        disk_backend = self._get_disk_backend()
+        cpu_backend = self._cpu_backend
+        disk_backend = self._disk_backend
         if cpu_backend is None or disk_backend is None:
             return False
 
@@ -384,8 +401,8 @@ class TierManager:
             True if the demotion completed or was successfully submitted,
             otherwise False.
         """
-        cpu_backend = self._get_cpu_backend()
-        disk_backend = self._get_disk_backend()
+        cpu_backend = self._cpu_backend
+        disk_backend = self._disk_backend
         if cpu_backend is None or disk_backend is None:
             return False
 
@@ -463,10 +480,6 @@ class TierManager:
                 logger.exception("TierManager iteration failed")
             self._stop_event.wait(self.interval_secs)
 
-    def _should_promote(self, key: CacheEngineKey, cpu_floor_score: float) -> bool:
-        disk_score = self.hotness_policy.get_score(key)
-        return disk_score > cpu_floor_score + PROMOTION_MARGIN
-
     def _load_disk_memory_obj(
         self,
         disk_backend: object,
@@ -497,26 +510,6 @@ class TierManager:
         if hasattr(memory_obj, "ref_count_down"):
             memory_obj.ref_count_down()
 
-    def _get_cpu_backend(self) -> Optional[object]:
-        if self._cached_cpu_backend is not None:
-            return self._cached_cpu_backend
-        backend = self.storage_manager.storage_backends.get("LocalCPUBackend")
-        if backend is None:
-            return None
-        required_methods = (
-            "get_capacity_bytes",
-            "get_usage_bytes",
-            "remove",
-            "remove_if_evictable",
-            "contains",
-            "get_blocking",
-            "submit_put_task",
-        )
-        if all(hasattr(backend, method_name) for method_name in required_methods):
-            self._cached_cpu_backend = cast(object, backend)
-            return self._cached_cpu_backend
-        return None
-
     def _remove_cpu_if_evictable(
         self, cpu_backend: object, key: CacheEngineKey
     ) -> bool:
@@ -524,14 +517,3 @@ class TierManager:
             return False
         return bool(cpu_backend.remove_if_evictable(key))
 
-    def _get_disk_backend(self) -> Optional[object]:
-        if self._cached_disk_backend is not None:
-            return self._cached_disk_backend
-        backend = self.storage_manager.storage_backends.get("LocalDiskBackend")
-        if backend is None:
-            return None
-        required_methods = ("get_blocking", "submit_put_task", "contains")
-        if all(hasattr(backend, method_name) for method_name in required_methods):
-            self._cached_disk_backend = cast(object, backend)
-            return self._cached_disk_backend
-        return None
