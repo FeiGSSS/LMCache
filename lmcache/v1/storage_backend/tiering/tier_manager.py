@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Any, Callable, Optional, Sequence, cast
 # First Party
 from lmcache.logging import init_logger
 from lmcache.utils import CacheEngineKey
-from lmcache.v1.storage_backend.hotness_policy import HotnessPolicy
+from lmcache.v1.storage_backend.tiering.hotness_policy import HotnessPolicy
 
 
 class Tier(Enum):

@@ -44,7 +44,7 @@ from lmcache.v1.storage_backend.abstract_backend import (
     StorageBackendInterface,
 )
 from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
-from lmcache.v1.storage_backend.tier_manager import TierManager
+from lmcache.v1.storage_backend.tiering import TierManager
 
 if TYPE_CHECKING:
     # First Party
