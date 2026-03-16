@@ -3,7 +3,7 @@
 from enum import Enum, auto
 from threading import Event, Lock, Thread
 from time import time
-from typing import TYPE_CHECKING, Optional, Sequence, cast
+from typing import TYPE_CHECKING, Any, Callable, Optional, Sequence, cast
 
 # First Party
 from lmcache.logging import init_logger
@@ -123,6 +123,92 @@ class TierManager:
 
     def clear_tier(self, tier: Tier) -> None:
         self.hotness_policy.clear_tier(tier)
+
+    def clear_tier_by_name(self, backend_name: str) -> None:
+        tier = self._backend_name_to_tier(backend_name)
+        if tier is not None:
+            self.hotness_policy.clear_tier(tier)
+
+    # ------------------------------------------------------------------
+    # Backend name ↔ Tier mapping
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _backend_name_to_tier(backend_name: str) -> Optional[Tier]:
+        if backend_name == "LocalCPUBackend":
+            return Tier.CPU
+        if backend_name == "LocalDiskBackend":
+            return Tier.DISK
+        if backend_name == "RemoteBackend":
+            return Tier.REMOTE
+        return None
+
+    # ------------------------------------------------------------------
+    # Callback factories for StorageManager put/evict flows
+    # ------------------------------------------------------------------
+
+    def make_put_complete_callback(
+        self, backend_name: str
+    ) -> Optional[Callable[[CacheEngineKey], None]]:
+        tier = self._backend_name_to_tier(backend_name)
+        if tier is None:
+            return None
+
+        def _callback(key: CacheEngineKey) -> None:
+            self.mark_resident(key, tier, True)
+
+        return _callback
+
+    def make_internal_evict_callback(
+        self, backend_name: str
+    ) -> Optional[Callable[[CacheEngineKey], None]]:
+        tier = self._backend_name_to_tier(backend_name)
+        if tier is None:
+            return None
+
+        def _callback(key: CacheEngineKey) -> None:
+            self.mark_resident(key, tier, False)
+
+        return _callback
+
+    def mark_resident_by_name(
+        self, key: CacheEngineKey, backend_name: str, present: bool
+    ) -> None:
+        tier = self._backend_name_to_tier(backend_name)
+        if tier is not None:
+            self.mark_resident(key, tier, present)
+
+    # ------------------------------------------------------------------
+    # Backend hook setup
+    # ------------------------------------------------------------------
+
+    def setup_backend_hooks(self) -> None:
+        self._setup_cpu_pressure_handler()
+        self._setup_evict_callbacks()
+
+    def teardown_cpu_pressure_handler(self) -> None:
+        from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
+
+        cpu = self.storage_manager.storage_backends.get("LocalCPUBackend")
+        if isinstance(cpu, LocalCPUBackend):
+            cpu.set_pressure_handler(None)
+
+    def _setup_cpu_pressure_handler(self) -> None:
+        from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
+
+        cpu = self.storage_manager.storage_backends.get("LocalCPUBackend")
+        if not isinstance(cpu, LocalCPUBackend):
+            return
+        cpu.set_pressure_handler(
+            self.ensure_cpu_headroom, self.cpu_high_watermark
+        )
+
+    def _setup_evict_callbacks(self) -> None:
+        for backend_name, backend in self.storage_manager.storage_backends.items():
+            if not hasattr(backend, "set_internal_evict_callback"):
+                continue
+            callback = self.make_internal_evict_callback(backend_name)
+            cast(Any, backend).set_internal_evict_callback(callback)
 
     # ------------------------------------------------------------------
 
