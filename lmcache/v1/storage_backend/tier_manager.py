@@ -7,11 +7,10 @@ from typing import TYPE_CHECKING, Optional, Sequence, cast
 # First Party
 from lmcache.logging import init_logger
 from lmcache.utils import CacheEngineKey
-from lmcache.v1.storage_backend.hotness_policy import (
-    HOTNESS_PROMOTION_MARGIN,
-    HotnessPolicy,
-    Tier,
-)
+from lmcache.v1.storage_backend.hotness_policy import HotnessPolicy
+from lmcache.v1.storage_backend.tier_defs import Tier
+
+PROMOTION_MARGIN = 0.05
 
 if TYPE_CHECKING:
     # First Party
@@ -170,7 +169,7 @@ class TierManager:
                 if state is None or Tier.DISK not in state.resident_tiers:
                     continue
                 cpu_score = self.hotness_policy.get_score(cpu_key)
-                if disk_score <= cpu_score + HOTNESS_PROMOTION_MARGIN:
+                if disk_score <= cpu_score + PROMOTION_MARGIN:
                     continue
                 victim_key = cpu_key
                 break
@@ -375,7 +374,7 @@ class TierManager:
 
     def _should_promote(self, key: CacheEngineKey, cpu_floor_score: float) -> bool:
         disk_score = self.hotness_policy.get_score(key)
-        return disk_score > cpu_floor_score + HOTNESS_PROMOTION_MARGIN
+        return disk_score > cpu_floor_score + PROMOTION_MARGIN
 
     def _load_disk_memory_obj(
         self,

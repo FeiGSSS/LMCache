@@ -4,7 +4,8 @@ import threading
 from types import SimpleNamespace
 
 # First Party
-from lmcache.v1.storage_backend.hotness_policy import HotnessPolicy, Tier
+from lmcache.v1.storage_backend.hotness_policy import HotnessPolicy
+from lmcache.v1.storage_backend.tier_defs import Tier
 from lmcache.v1.storage_backend.tier_manager import TierManager
 from tests.v1.utils import dumb_cache_engine_key
 

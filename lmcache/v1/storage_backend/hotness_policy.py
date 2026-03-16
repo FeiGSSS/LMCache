@@ -3,7 +3,6 @@
 import copy
 import heapq
 from dataclasses import dataclass, field
-from enum import Enum, auto
 from math import exp, log1p
 from threading import RLock
 from time import time
@@ -11,6 +10,7 @@ from typing import Optional, Sequence
 
 # First Party
 from lmcache.utils import CacheEngineKey
+from lmcache.v1.storage_backend.tier_defs import Tier
 
 HIT_CAP = 32
 PREFIX_DECAY = 16.0
@@ -19,23 +19,6 @@ AGE_DECAY = 32.0
 PREFIX_WEIGHT = 0.45
 AGE_WEIGHT = 0.35
 HIT_WEIGHT = 0.20
-
-PROMOTION_MARGIN = 0.05
-
-# Re-export for backwards compatibility with existing imports
-HOTNESS_HIT_CAP = HIT_CAP
-HOTNESS_PREFIX_DECAY = PREFIX_DECAY
-HOTNESS_AGE_DECAY_SECS = AGE_DECAY
-HOTNESS_PREFIX_WEIGHT = PREFIX_WEIGHT
-HOTNESS_AGE_WEIGHT = AGE_WEIGHT
-HOTNESS_HIT_WEIGHT = HIT_WEIGHT
-HOTNESS_PROMOTION_MARGIN = PROMOTION_MARGIN
-
-
-class Tier(Enum):
-    CPU = auto()
-    DISK = auto()
-    REMOTE = auto()
 
 
 @dataclass
