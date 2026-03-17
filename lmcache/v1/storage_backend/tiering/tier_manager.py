@@ -288,7 +288,7 @@ class TierManager:
         watermark.  Called by the CPU backend pressure handler.
         """
         cpu = self._cpu_backend
-        if cpu is None or cpu.capacity_bytes <= 0:
+        if cpu.capacity_bytes <= 0:
             return False
 
         target = int(cpu.capacity_bytes * self.cpu_low_watermark)
@@ -338,7 +338,9 @@ class TierManager:
         the disk ⊇ CPU invariant).
         """
         state = self.hotness_policy.get_state(key)
-        assert state is not None and Tier.CPU in state.resident_tiers
+        if state is None or Tier.CPU not in state.resident_tiers:
+            logger.error("demote_key: invalid state for key %s: %s", key, state)
+            return False
         if Tier.DISK not in state.resident_tiers:
             return False
 

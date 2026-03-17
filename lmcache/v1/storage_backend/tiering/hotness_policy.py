@@ -10,7 +10,10 @@ from time import time
 from typing import Hashable, Optional
 
 # First Party
+from lmcache.logging import init_logger
 from lmcache.utils import CacheEngineKey
+
+logger = init_logger(__name__)
 
 HIT_CAP = 32
 PREFIX_DECAY = 16.0
@@ -146,7 +149,12 @@ class HotnessPolicy:
         """
         with self._lock:
             for key in self._tier_keys[tier]:
-                state = self._states[key]
+                state = self._states.get(key)
+                if state is None:
+                    logger.error(
+                        "clear_tier: key %s in tier_keys but missing from states", key
+                    )
+                    continue
                 state.resident_tiers.discard(tier)
                 if not state.resident_tiers:
                     self._states.pop(key, None)
@@ -194,6 +202,7 @@ class HotnessPolicy:
         self,
         tier: Hashable,
         limit: Optional[int] = None,
+        require_absent_in: Optional[Hashable] = None,
         exclude: Optional[set[CacheEngineKey]] = None,
         now: Optional[float] = None,
     ) -> list[tuple[CacheEngineKey, float]]:
@@ -203,22 +212,15 @@ class HotnessPolicy:
         Returns a list of ``(key, score)`` pairs sorted coldest-first.
         When *limit* is given, uses ``heapq.nsmallest`` — O(n log limit).
         """
-        timestamp = time() if now is None else now
-        excluded = exclude or set()
-        with self._lock:
-            scored = [
-                (key, self._compute_score(self._states[key], timestamp))
-                for key in self._tier_keys[tier]
-                if key not in excluded and key in self._states
-            ]
-            if limit is None:
-                return sorted(scored, key=lambda p: p[1])
-            return heapq.nsmallest(limit, scored, key=lambda p: p[1])
+        scored = self._score_tier(tier, require_absent_in, exclude, now)
+        if limit is None:
+            return sorted(scored, key=lambda p: p[1])
+        return heapq.nsmallest(limit, scored, key=lambda p: p[1])
 
     def select_hottest(
         self,
         tier: Hashable,
-        limit: int,
+        limit: Optional[int] = None,
         require_absent_in: Optional[Hashable] = None,
         exclude: Optional[set[CacheEngineKey]] = None,
         now: Optional[float] = None,
@@ -227,8 +229,20 @@ class HotnessPolicy:
         Select the hottest keys currently resident in ``tier``.
 
         Returns a list of ``(key, score)`` pairs sorted hottest-first.
-        Uses ``heapq.nlargest`` — O(n log limit) instead of O(n log n).
+        When *limit* is given, uses ``heapq.nlargest`` — O(n log limit).
         """
+        scored = self._score_tier(tier, require_absent_in, exclude, now)
+        if limit is None:
+            return sorted(scored, key=lambda p: p[1], reverse=True)
+        return heapq.nlargest(limit, scored, key=lambda p: p[1])
+
+    def _score_tier(
+        self,
+        tier: Hashable,
+        require_absent_in: Optional[Hashable] = None,
+        exclude: Optional[set[CacheEngineKey]] = None,
+        now: Optional[float] = None,
+    ) -> list[tuple[CacheEngineKey, float]]:
         timestamp = time() if now is None else now
         excluded = exclude or set()
         with self._lock:
@@ -245,7 +259,7 @@ class HotnessPolicy:
                 scored.append(
                     (key, self._compute_score(state, timestamp))
                 )
-            return heapq.nlargest(limit, scored, key=lambda p: p[1])
+            return scored
 
     def _compute_score(self, state: HotnessState, now: float) -> float:
         prefix_score = exp(-state.prefix_pos / PREFIX_DECAY)

@@ -57,6 +57,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
 
         self.cache_policy = get_cache_policy(config.cache_policy)
         self.hot_cache = self.cache_policy.init_mutable_mapping()
+        self._usage_bytes = 0
 
         self.use_hot = config.local_cpu
         self.config = config
@@ -73,9 +74,6 @@ class LocalCPUBackend(AllocatorBackendInterface):
         self.lmcache_worker = lmcache_worker
         self.instance_id = config.lmcache_instance_id
         self.cpu_lock = threading.Lock()
-        self._pressure_handler: Optional[Callable[[], bool]] = None
-        self._pressure_high_watermark: Optional[float] = None
-        self._internal_evict_callback: Optional[Callable[[CacheEngineKey], None]] = None
 
         self.stats_monitor = LMCStatsMonitor.GetOrCreate()
 
@@ -137,6 +135,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
         self,
         handler: Optional[Callable[[], bool]],
         high_watermark: Optional[float] = None,
+        low_watermark: Optional[float] = None,
     ) -> None:
         """
         Register a synchronous CPU-pressure handler.
@@ -147,11 +146,14 @@ class LocalCPUBackend(AllocatorBackendInterface):
         Args:
             handler: Callable that tries to create CPU headroom and returns
                 whether it made progress. ``None`` clears the current handler.
-            high_watermark: Optional CPU usage ratio that triggers the handler
+            high_watermark: CPU usage ratio that triggers the handler
                 immediately after an admit when exceeded.
+            low_watermark: CPU usage ratio that the handler targets to
+                reach when relieving pressure.
         """
         self._pressure_handler = handler
         self._pressure_high_watermark = high_watermark
+        self._pressure_low_watermark = low_watermark
 
     def set_internal_evict_callback(
         self,
@@ -193,6 +195,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
 
             memory_obj.ref_count_up()
             self.hot_cache[key] = memory_obj
+            self._usage_bytes += memory_obj.get_physical_size()
 
             self.cache_policy.update_on_put(key)
 
@@ -315,6 +318,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
             return False
 
         memory_obj = self.hot_cache.pop(key)
+        self._usage_bytes -= memory_obj.get_physical_size()
         memory_obj.ref_count_down()
 
         if force:
@@ -729,12 +733,14 @@ class LocalCPUBackend(AllocatorBackendInterface):
                         for evict_key in evict_keys:
                             evict_key_all_layer = evict_key.split_layers(batch_size)
 
-                            # TODO(Jiayi): batched allocate is not supported through
-                            # `batched_remove`. Therefore, features like usage tracking
-                            # is not supported.
+                            # NOTE: Cannot use batched_remove here because
+                            # batched_allocate needs direct access to old MemoryObjs
+                            # for batched_free.
                             old_mem_objs = []
                             for key in evict_key_all_layer:
-                                old_mem_objs.append(self.hot_cache[key])
+                                mem_obj = self.hot_cache[key]
+                                old_mem_objs.append(mem_obj)
+                                self._usage_bytes -= mem_obj.get_physical_size()
                                 self.cache_policy.update_on_force_evict(key)
                                 self.hot_cache.pop(key, None)
                                 self._notify_internal_evict(key)
@@ -852,12 +858,9 @@ class LocalCPUBackend(AllocatorBackendInterface):
     @property
     def usage_bytes(self) -> int:
         """
-        Estimate current CPU hot-cache usage in bytes.
+        Current CPU hot-cache usage in bytes (maintained incrementally).
         """
-        with self.cpu_lock:
-            return sum(
-                memory_obj.get_physical_size() for memory_obj in self.hot_cache.values()
-            )
+        return self._usage_bytes
 
     def clear(self) -> int:
         """
@@ -894,19 +897,19 @@ class LocalCPUBackend(AllocatorBackendInterface):
         self.clear()
 
     def _maybe_relieve_pressure(self) -> bool:
-        handler = self._pressure_handler
+        handler = getattr(self, "_pressure_handler", None)
         if handler is None:
             return False
 
         try:
-            return bool(handler())
+            return handler()
         except Exception:
             logger.exception("CPU pressure handler failed")
             return False
 
     def _maybe_relieve_post_admit_pressure(self) -> None:
-        handler = self._pressure_handler
-        high_watermark = self._pressure_high_watermark
+        handler = getattr(self, "_pressure_handler", None)
+        high_watermark = getattr(self, "_pressure_high_watermark", None)
         if handler is None or high_watermark is None:
             return
 
@@ -914,8 +917,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
         if capacity_bytes <= 0:
             return
 
-        usage_bytes = self.usage_bytes
-        if usage_bytes <= capacity_bytes * high_watermark:
+        if self.usage_bytes <= capacity_bytes * high_watermark:
             return
 
         try:
@@ -924,7 +926,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
             logger.exception("Post-admit CPU pressure handler failed")
 
     def _notify_internal_evict(self, key: CacheEngineKey) -> None:
-        callback = self._internal_evict_callback
+        callback = getattr(self, "_internal_evict_callback", None)
         if callback is None:
             return
 
