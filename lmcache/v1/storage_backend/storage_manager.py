@@ -1261,10 +1261,13 @@ class StorageManager:
                 )
                 return False
 
+            # Stop tier manager to prevent stale backend access
+            if self.tier_manager is not None:
+                self.tier_manager.stop()
+                self.tier_manager.teardown_backend_hooks(backend_name)
+
             try:
                 logger.info("Closing backend: %s", backend_name)
-                if self.tier_manager is not None:
-                    self.tier_manager.teardown_backend_hooks(backend_name)
                 backend.close()
             except Exception:
                 logger.exception("Error closing backend %s", backend_name)
@@ -1325,6 +1328,7 @@ class StorageManager:
 
         if self.tier_manager is not None:
             self.tier_manager.setup_backend_hooks()
+            self.tier_manager.start()
         return created
 
     def recreate_backend(self, backend_name: str) -> Dict[str, str]:
@@ -1352,10 +1356,13 @@ class StorageManager:
                 raise KeyError("Backend %s not found" % backend_name)
 
             # --- close ---
+            # Stop tier manager to prevent stale backend access
+            if self.tier_manager is not None:
+                self.tier_manager.stop()
+                self.tier_manager.teardown_backend_hooks(backend_name)
+
             try:
                 logger.info("Closing backend: %s", backend_name)
-                if self.tier_manager is not None:
-                    self.tier_manager.teardown_backend_hooks(backend_name)
                 backend.close()
             except Exception:
                 logger.exception("Error closing backend %s", backend_name)
@@ -1395,6 +1402,7 @@ class StorageManager:
 
         if self.tier_manager is not None:
             self.tier_manager.setup_backend_hooks()
+            self.tier_manager.start()
         return created
 
     def close(self):

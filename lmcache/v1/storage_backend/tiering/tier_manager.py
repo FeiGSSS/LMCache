@@ -189,7 +189,7 @@ class TierManager:
 
         lcb = backends.get("LocalCPUBackend")
         ldb = backends.get("LocalDiskBackend")
-        if not (isinstance(lcb, LocalCPUBackend) and isinstance(ldb, LocalDiskBackend)):
+        if lcb is None or ldb is None:
             raise RuntimeError(
                 "TierManager requires LocalCPUBackend and LocalDiskBackend "
                 "to be present in StorageManager"
