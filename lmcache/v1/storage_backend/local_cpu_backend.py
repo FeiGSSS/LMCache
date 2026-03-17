@@ -865,7 +865,8 @@ class LocalCPUBackend(AllocatorBackendInterface):
         """
         return self.get_keys()
 
-    def get_usage_bytes(self) -> int:
+    @property
+    def usage_bytes(self) -> int:
         """
         Estimate current CPU hot-cache usage in bytes.
         """
@@ -929,7 +930,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
         if capacity_bytes <= 0:
             return
 
-        usage_bytes = self.get_usage_bytes()
+        usage_bytes = self.usage_bytes
         if usage_bytes <= capacity_bytes * high_watermark:
             return
 

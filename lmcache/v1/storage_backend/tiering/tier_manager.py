@@ -314,7 +314,7 @@ class TierManager:
         relieved = False
 
         with self._pressure_lock:
-            usage_bytes = cpu_backend.get_usage_bytes()
+            usage_bytes = cpu_backend.usage_bytes
             if usage_bytes <= target_bytes:
                 return False
 
@@ -331,7 +331,7 @@ class TierManager:
                     if self.demote_key(key):
                         relieved = True
                         made_progress = True
-                        usage_bytes = cpu_backend.get_usage_bytes()
+                        usage_bytes = cpu_backend.usage_bytes
                         if usage_bytes <= target_bytes:
                             break
 
