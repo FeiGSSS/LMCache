@@ -292,51 +292,23 @@ class TierManager:
 
     def ensure_cpu_headroom(self) -> bool:
         """
-        Synchronously demote CPU-resident keys until usage drops below the low
-        watermark.
-
-        This method is the event-driven CPU demotion path used by the local CPU
-        pressure handler.
-
-        Returns:
-            True if any CPU headroom was created, otherwise False.
+        Demote coldest CPU-resident keys until usage drops below the low
+        watermark.  Called by the CPU backend pressure handler.
         """
-        cpu_backend = self._cpu_backend
-        disk_backend = self._disk_backend
-        if cpu_backend is None or disk_backend is None:
+        cpu = self._cpu_backend
+        if cpu is None or cpu.capacity_bytes <= 0:
             return False
 
-        capacity_bytes = cpu_backend.capacity_bytes
-        if capacity_bytes <= 0:
-            return False
-
-        target_bytes = int(capacity_bytes * self.cpu_low_watermark)
+        target = int(cpu.capacity_bytes * self.cpu_low_watermark)
         relieved = False
 
         with self._pressure_lock:
-            usage_bytes = cpu_backend.usage_bytes
-            if usage_bytes <= target_bytes:
-                return False
-
-            while usage_bytes > target_bytes:
-                candidates = self.hotness_policy.select_coldest(
-                    Tier.CPU,
-                    limit=self.max_actions_per_tick,
-                )
-                if not candidates:
+            candidates = self.hotness_policy.select_coldest(Tier.CPU)
+            for key, _ in candidates:
+                if cpu.usage_bytes <= target:
                     break
-
-                made_progress = False
-                for key, _score in candidates:
-                    if self.demote_key(key):
-                        relieved = True
-                        made_progress = True
-                        usage_bytes = cpu_backend.usage_bytes
-                        if usage_bytes <= target_bytes:
-                            break
-
-                if not made_progress:
-                    break
+                if self.demote_key(key):
+                    relieved = True
 
         return relieved
 
@@ -379,7 +351,7 @@ class TierManager:
         if victim_state is None or Tier.DISK not in victim_state.resident_tiers:
             self._release_memory_obj(memory_obj)
             return False
-        if not self._remove_cpu_if_evictable(cpu_backend, victim_cpu_key):
+        if not cpu_backend.remove_if_evictable(victim_cpu_key):
             self._release_memory_obj(memory_obj)
             return False
 
@@ -388,25 +360,18 @@ class TierManager:
 
     def demote_key(self, key: CacheEngineKey) -> bool:
         """
-        Demote key from CPU to disk.
-
-        With the disk ⊇ CPU invariant (batched_put writes to both tiers),
-        demotion is a pure in-memory operation: just remove the CPU copy.
+        Demote key from CPU: remove CPU copy (disk already has it per
+        the disk ⊇ CPU invariant).
         """
-        cpu_backend = self._cpu_backend
-
         state = self.hotness_policy.get_state(key)
-        if state is None or Tier.CPU not in state.resident_tiers:
-            return False
-
-        # Safety: skip if disk doesn't have it (disk-full edge case)
+        assert state is not None and Tier.CPU in state.resident_tiers
         if Tier.DISK not in state.resident_tiers:
             return False
 
-        if self._remove_cpu_if_evictable(cpu_backend, key):
-            self.hotness_policy.remove_resident(key, Tier.CPU)
-            return True
-        return False
+        if not self._cpu_backend.remove_if_evictable(key):
+            return False
+        self.hotness_policy.remove_resident(key, Tier.CPU)
+        return True
 
     def _run_loop(self) -> None:
         while not self._stop_event.is_set():
@@ -446,10 +411,4 @@ class TierManager:
         if hasattr(memory_obj, "ref_count_down"):
             memory_obj.ref_count_down()
 
-    def _remove_cpu_if_evictable(
-        self, cpu_backend: object, key: CacheEngineKey
-    ) -> bool:
-        if not hasattr(cpu_backend, "remove_if_evictable"):
-            return False
-        return bool(cpu_backend.remove_if_evictable(key))
 

@@ -142,7 +142,7 @@ class LocalDiskBackend(StorageBackendInterface):
 
         # TODO(Jiayi): We need a disk space allocator to avoid fragmentation
         # and hide the following details away from the backend.
-        self.max_cache_size = int(config.max_local_disk_size * 1024**3)
+        self.capacity_bytes = int(config.max_local_disk_size * 1024**3)
         self.current_cache_size = 0.0
 
         # to help maintain suffix -> prefix order in the dict
@@ -339,7 +339,7 @@ class LocalDiskBackend(StorageBackendInterface):
             # TODO: Disk LRU eviction may evict keys that are still CPU-resident,
             # breaking the disk ⊇ CPU invariant. If this happens, demote_key will
             # skip these keys. Consider adding an eviction filter to prevent this.
-            while self.current_cache_size + required_size > self.max_cache_size:
+            while self.current_cache_size + required_size > self.capacity_bytes:
                 evict_keys = self.cache_policy.get_evict_candidates(
                     self.dict, num_candidates=1
                 )
@@ -663,17 +663,12 @@ class LocalDiskBackend(StorageBackendInterface):
         with self.disk_lock:
             return list(self.dict.keys())
 
-    def get_usage_bytes(self) -> int:
+    @property
+    def usage_bytes(self) -> int:
         """
         Return current disk-cache usage in bytes.
         """
         return int(self.current_cache_size)
-
-    def get_capacity_bytes(self) -> int:
-        """
-        Return configured disk-cache capacity in bytes.
-        """
-        return self.max_cache_size
 
     def close(self) -> None:
         if self.batched_msg_sender is not None:

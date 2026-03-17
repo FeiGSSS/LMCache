@@ -329,33 +329,17 @@ class LocalCPUBackend(AllocatorBackendInterface):
         # NOTE (Jiayi): This `return True` might not accurately reflect
         # whether the key is removed from the actual memory because
         # other backends might still (temporarily) hold the memory object.
-        if not force:
-            self._notify_internal_evict(key)
         return True
 
     def remove_if_evictable(self, key: CacheEngineKey) -> bool:
         """
-        Remove a key only when the resident object is currently evictable.
-
-        Returns:
-            ``True`` if the key was evicted from CPU cache, ``False`` otherwise.
+        Remove a key only if the resident object is currently evictable.
         """
         with self.cpu_lock:
             memory_obj = self.hot_cache.get(key)
-            if memory_obj is None:
+            if memory_obj is None or not memory_obj.can_evict:
                 return False
-            if not memory_obj.can_evict:
-                return False
-            self.hot_cache.pop(key, None)
-            memory_obj.ref_count_down()
-            self.cache_policy.update_on_force_evict(key)
-
-        if self.batched_msg_sender is not None:
-            self.batched_msg_sender.add_kv_op(
-                op_type=OpType.EVICT,
-                key=key.chunk_hash,
-            )
-        return True
+            return self.remove(key, force=False)
 
     def _calculate_effective_cpu_size(
         self,

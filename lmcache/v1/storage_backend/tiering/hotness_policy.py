@@ -193,7 +193,7 @@ class HotnessPolicy:
     def select_coldest(
         self,
         tier: Hashable,
-        limit: int,
+        limit: Optional[int] = None,
         exclude: Optional[set[CacheEngineKey]] = None,
         now: Optional[float] = None,
     ) -> list[tuple[CacheEngineKey, float]]:
@@ -201,7 +201,7 @@ class HotnessPolicy:
         Select the coldest keys currently resident in ``tier``.
 
         Returns a list of ``(key, score)`` pairs sorted coldest-first.
-        Uses ``heapq.nsmallest`` — O(n log limit) instead of O(n log n).
+        When *limit* is given, uses ``heapq.nsmallest`` — O(n log limit).
         """
         timestamp = time() if now is None else now
         excluded = exclude or set()
@@ -211,6 +211,8 @@ class HotnessPolicy:
                 for key in self._tier_keys[tier]
                 if key not in excluded and key in self._states
             ]
+            if limit is None:
+                return sorted(scored, key=lambda p: p[1])
             return heapq.nsmallest(limit, scored, key=lambda p: p[1])
 
     def select_hottest(
