@@ -561,6 +561,9 @@ class StorageManager:
                     else None,
                 )
 
+        # Pad with None so callers always get len(keys) entries.
+        if len(results) < len(keys):
+            results.extend([None] * (len(keys) - len(results)))
         return results
 
     def layerwise_batched_get(
