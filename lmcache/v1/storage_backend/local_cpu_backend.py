@@ -419,22 +419,29 @@ class LocalCPUBackend(AllocatorBackendInterface):
         metadata: Optional[LMCacheMetadata] = None,
     ) -> MemoryAllocatorInterface:
         cpu_size = config.max_local_cpu_size
+        
         if metadata is not None:
+            # save_only_first_rank only works when use mla
             save_only_first_rank = (
                 config.get_extra_config_value("save_only_first_rank", metadata.use_mla)
                 and metadata.use_mla
             )
+            
             if save_only_first_rank and metadata.is_first_rank():
+                # Only the first rank will save the cache,
+                # so we need to set it larger than other ranks
                 cpu_size = config.get_extra_config_value(
                     "first_rank_max_local_cpu_size", cpu_size
                 )
-        cpu_size = self._calculate_effective_cpu_size(cpu_size, config, metadata)
-        self.capacity_bytes = int(cpu_size * 1024**3)
-        cpu_size = self.capacity_bytes / 1024**3
 
         # Detect the numa mapping
         numa_mapping = NUMADetector.get_numa_mapping(config)
         logger.info(f"NUMA mapping {numa_mapping}")
+        
+        # Calculate effective CPU memory size
+        cpu_size = self._calculate_effective_cpu_size(cpu_size, config, metadata)
+        cpu_size_bytes = int(cpu_size * 1024**3)
+        self.capacity_bytes = cpu_size_bytes 
 
         allocator_align_bytes = self._resolve_local_cpu_allocator_alignment(config)
         if allocator_align_bytes is not None:
