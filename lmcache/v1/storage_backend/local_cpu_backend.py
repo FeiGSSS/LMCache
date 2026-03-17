@@ -61,7 +61,6 @@ class LocalCPUBackend(AllocatorBackendInterface):
         self.use_hot = config.local_cpu
         self.config = config
         self.metadata = metadata
-        self._capacity_bytes = self._resolve_capacity_bytes(config, metadata)
         # NOTE: we keep the memory allocator argument for temporary
         # test compatibility
         # TODO: fix the tests to get rid the memory allocator
@@ -419,9 +418,19 @@ class LocalCPUBackend(AllocatorBackendInterface):
         config: LMCacheEngineConfig,
         metadata: Optional[LMCacheMetadata] = None,
     ) -> MemoryAllocatorInterface:
-        cpu_size_bytes = self._resolve_capacity_bytes(config, metadata)
-        cpu_size = cpu_size_bytes / 1024**3
-        self._capacity_bytes = cpu_size_bytes
+        cpu_size = config.max_local_cpu_size
+        if metadata is not None:
+            save_only_first_rank = (
+                config.get_extra_config_value("save_only_first_rank", metadata.use_mla)
+                and metadata.use_mla
+            )
+            if save_only_first_rank and metadata.is_first_rank():
+                cpu_size = config.get_extra_config_value(
+                    "first_rank_max_local_cpu_size", cpu_size
+                )
+        cpu_size = self._calculate_effective_cpu_size(cpu_size, config, metadata)
+        self.capacity_bytes = int(cpu_size * 1024**3)
+        cpu_size = self.capacity_bytes / 1024**3
 
         # Detect the numa mapping
         numa_mapping = NUMADetector.get_numa_mapping(config)
@@ -823,7 +832,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
         Returns:
             int: The estimated chunk budget for concurrent allocations
         """
-        total_memory = self.get_capacity_bytes()
+        total_memory = self.capacity_bytes
         chunk_bytes = self.get_full_chunk_size_bytes()
         # add alignment overhead
         # (MixedMemoryAllocator uses TensorMemoryAllocator with 4KB alignment)
@@ -857,12 +866,6 @@ class LocalCPUBackend(AllocatorBackendInterface):
             return sum(
                 memory_obj.get_physical_size() for memory_obj in self.hot_cache.values()
             )
-
-    def get_capacity_bytes(self) -> int:
-        """
-        Return the effective CPU hot-cache capacity in bytes.
-        """
-        return self._capacity_bytes
 
     def clear(self) -> int:
         """
@@ -915,7 +918,7 @@ class LocalCPUBackend(AllocatorBackendInterface):
         if handler is None or high_watermark is None:
             return
 
-        capacity_bytes = self.get_capacity_bytes()
+        capacity_bytes = self.capacity_bytes
         if capacity_bytes <= 0:
             return
 
@@ -938,22 +941,3 @@ class LocalCPUBackend(AllocatorBackendInterface):
         except Exception:
             logger.exception("Internal CPU eviction callback failed for key %s", key)
 
-    def _resolve_capacity_bytes(
-        self,
-        config: LMCacheEngineConfig,
-        metadata: Optional[LMCacheMetadata],
-    ) -> int:
-        cpu_size = config.max_local_cpu_size
-
-        if metadata is not None:
-            save_only_first_rank = (
-                config.get_extra_config_value("save_only_first_rank", metadata.use_mla)
-                and metadata.use_mla
-            )
-            if save_only_first_rank and metadata.is_first_rank():
-                cpu_size = config.get_extra_config_value(
-                    "first_rank_max_local_cpu_size", cpu_size
-                )
-
-        cpu_size = self._calculate_effective_cpu_size(cpu_size, config, metadata)
-        return int(cpu_size * 1024**3)

@@ -306,7 +306,7 @@ class TierManager:
         if cpu_backend is None or disk_backend is None:
             return False
 
-        capacity_bytes = cpu_backend.get_capacity_bytes()
+        capacity_bytes = cpu_backend.capacity_bytes
         if capacity_bytes <= 0:
             return False
 
