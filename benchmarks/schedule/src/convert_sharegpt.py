@@ -1,14 +1,6 @@
-#!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""
-转换 ShareGPT 数据为 vllm benchmark 格式。
 
-将原始 ShareGPT JSON 转换为:
-[
-    {"id": "conv_123", "messages": [{"role": "user", "content": "..."}, ...]},
-    ...
-]
-"""
+from __future__ import annotations
 
 import argparse
 import json
@@ -19,9 +11,9 @@ from typing import Any
 
 
 def load_raw_data(input_path: str) -> list[dict[str, Any]]:
-    """加载原始 ShareGPT 数据"""
-    with open(input_path, encoding="utf-8") as f:
-        data = json.load(f)
+    """Load raw ShareGPT data."""
+    with open(input_path, encoding="utf-8") as file:
+        data = json.load(file)
     print(f"加载了 {len(data)} 条原始记录")
     return data
 
@@ -29,30 +21,20 @@ def load_raw_data(input_path: str) -> list[dict[str, Any]]:
 def merge_conversation_parts(
     data: list[dict[str, Any]],
 ) -> dict[str, list[dict[str, str]]]:
-    """
-    合并同一对话的多片段。
-
-    输入数据 ID 格式: "convID_index"，需要按 convID 合并。
-    """
-    # 按对话ID分组
+    """Merge conversation shards with the same conversation id."""
     conversation_parts: dict[str, list[dict[str, str]]] = defaultdict(list)
 
     for item in data:
         raw_id = item["id"]
-        # 分割 ID: "hRPPgZT_0" -> "hRPPgZT", "0"
-        if "_" in raw_id:
-            conv_id = raw_id.rsplit("_", 1)[0]
-        else:
-            conv_id = raw_id
+        conv_id = raw_id.rsplit("_", 1)[0] if "_" in raw_id else raw_id
 
         turns = item["conversations"]
         if not turns:
             continue
 
-        # 如果上一片段的最后一条和当前片段的第一条来自同一人，跳过重复
         if conv_id in conversation_parts and conversation_parts[conv_id]:
-            prev_turns = conversation_parts[conv_id][-1]
-            if prev_turns and prev_turns.get("from") == turns[0].get("from"):
+            prev_turn = conversation_parts[conv_id][-1]
+            if prev_turn and prev_turn.get("from") == turns[0].get("from"):
                 turns = turns[1:]
 
         if turns:
@@ -63,75 +45,72 @@ def merge_conversation_parts(
 
 
 def convert_role(from_val: str) -> str | None:
-    """转换 from 字段到 role 字段"""
+    """Convert ShareGPT role names to OpenAI role names."""
     if from_val in {"human", "user"}:
         return "user"
-    elif from_val in {"gpt", "bing", "chatgpt", "bard"}:
+    if from_val in {"gpt", "bing", "chatgpt", "bard"}:
         return "assistant"
-    elif from_val == "system":
+    if from_val == "system":
         return "system"
     return None
 
 
 def is_valid_conversation(messages: list[dict[str, str]]) -> bool:
-    """验证对话是否有效"""
+    """Validate a user/assistant alternating conversation."""
     if not messages:
         return False
 
-    # 第一条必须是 user
     if messages[0].get("role") != "user":
         return False
 
-    # 检查交替
     expected_role = "user"
-    for msg in messages:
-        if msg.get("role") != expected_role:
+    for message in messages:
+        if message.get("role") != expected_role:
             return False
         expected_role = "assistant" if expected_role == "user" else "user"
 
     return True
 
 
+def count_user_turns(messages: list[dict[str, str]]) -> int:
+    """Count user turns in converted messages."""
+    return sum(1 for message in messages if message.get("role") == "user")
+
+
 def convert_to_openai_format(
     conversations: dict[str, list[dict[str, str]]],
     min_turns: int | None = None,
     max_turns: int | None = None,
+    min_user_turns: int | None = None,
 ) -> list[dict[str, Any]]:
-    """转换为 OpenAI 格式"""
+    """Convert merged ShareGPT conversations to benchmark format."""
     result = []
 
     for conv_id, turns in conversations.items():
-        # 过滤包含 system 的对话
-        if any(t.get("from") == "system" for t in turns):
+        if any(turn.get("from") == "system" for turn in turns):
             continue
 
-        # 转换 role
         messages = []
-        for i, turn in enumerate(turns):
+        for turn in turns:
             role = convert_role(turn.get("from", ""))
             if role is None:
                 continue
             if role == "system":
-                # 跳过包含 system 的对话
                 break
             messages.append({"role": role, "content": turn.get("value", "")})
-        else:
-            # 如果上面没有 break，继续处理
-            pass
 
-        # 检查是否因为 system 被跳过
-        if any(m.get("role") == "system" for m in messages):
+        if any(message.get("role") == "system" for message in messages):
             continue
 
-        # 限制轮数
         if max_turns is not None and len(messages) > max_turns:
             messages = messages[:max_turns]
 
-        # 跳过短对话
         if min_turns is not None and len(messages) < min_turns:
             continue
 
-        # 验证对话有效性
+        if min_user_turns is not None and count_user_turns(messages) < min_user_turns:
+            continue
+
         if not is_valid_conversation(messages):
             continue
 
@@ -142,22 +121,23 @@ def convert_to_openai_format(
 
 
 def print_stats(conversations: list[dict[str, Any]]) -> None:
-    """打印统计信息"""
+    """Print summary stats for converted conversations."""
     if not conversations:
         return
 
-    turn_counts = [len(c["messages"]) for c in conversations]
-    print(f"\n=== 统计信息 ===")
+    turn_counts = [len(conversation["messages"]) for conversation in conversations]
+    user_turn_counts = [
+        count_user_turns(conversation["messages"]) for conversation in conversations
+    ]
+    print("\n=== 统计信息 ===")
     print(f"对话数: {len(conversations)}")
     print(
         f"消息数: min={min(turn_counts)}, max={max(turn_counts)}, avg={sum(turn_counts) / len(turn_counts):.1f}"
     )
-
-    # 轮数分布 (user->assistant 为一轮)
-    user_count = sum(
-        1 for c in conversations for m in c["messages"] if m["role"] == "user"
+    print(
+        f"用户轮数: min={min(user_turn_counts)}, max={max(user_turn_counts)}, avg={sum(user_turn_counts) / len(user_turn_counts):.1f}"
     )
-    print(f"总轮数 (user轮): {user_count}")
+    print(f"总轮数 (user轮): {sum(user_turn_counts)}")
 
 
 def select_conversations(
@@ -166,16 +146,16 @@ def select_conversations(
     selection: str,
     seed: int,
 ) -> list[dict[str, Any]]:
-    """按策略选择需要输出的对话子集。"""
+    """Select a subset of conversations by strategy."""
     selected = list(conversations)
 
     if selection == "random":
-        random.seed(seed)
-        random.shuffle(selected)
+        rng = random.Random(seed)
+        rng.shuffle(selected)
     elif selection == "length_desc":
-        selected.sort(key=lambda x: len(x.get("messages", [])), reverse=True)
+        selected.sort(key=lambda item: len(item.get("messages", [])), reverse=True)
     elif selection == "length_asc":
-        selected.sort(key=lambda x: len(x.get("messages", [])))
+        selected.sort(key=lambda item: len(item.get("messages", [])))
     else:
         raise ValueError(f"Unsupported selection mode: {selection}")
 
@@ -185,17 +165,23 @@ def select_conversations(
     return selected
 
 
-def main():
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="转换 ShareGPT 数据为 vllm 格式")
     parser.add_argument(
         "--input",
         type=str,
-        default="/home/fei/research/datasets/ShareGPT_V3_unfiltered_cleaned_split/ShareGPT_V3_unfiltered_cleaned_split.json",
+        default="/data/llm-datasets/ShareGPT_V3_unfiltered_cleaned_split/ShareGPT_V3_unfiltered_cleaned_split.json",
         help="输入文件路径",
     )
     parser.add_argument("--output", type=str, default=None, help="输出文件路径")
-    parser.add_argument("--min-turns", type=int, default=None, help="最小轮数")
-    parser.add_argument("--max-turns", type=int, default=None, help="最大轮数")
+    parser.add_argument("--min-turns", type=int, default=None, help="最小消息数")
+    parser.add_argument("--max-turns", type=int, default=None, help="最大消息数")
+    parser.add_argument(
+        "--min-user-turns",
+        type=int,
+        default=None,
+        help="最小 user turn 数，用于保留更长的多轮对话",
+    )
     parser.add_argument("--seed", type=int, default=42, help="随机种子")
     parser.add_argument(
         "--count",
@@ -210,34 +196,34 @@ def main():
         choices=["random", "length_desc", "length_asc"],
         help="对话选择策略，默认按长度降序",
     )
+    return parser
 
+
+def main() -> None:
+    parser = build_parser()
     args = parser.parse_args()
 
     if args.count <= 0:
         raise ValueError("--count must be a positive integer")
 
-    # 设置输出路径
     if args.output is None:
-        script_dir = Path(__file__).parent
-        args.output = str(script_dir / "sharegpt_conv.json")
+        script_dir = Path(__file__).resolve().parent.parent
+        args.output = str(script_dir / "dataset" / "sharegpt_conv.json")
 
-    # 加载数据
     print(f"读取输入文件: {args.input}")
     raw_data = load_raw_data(args.input)
 
-    # 合并多片段
     print("合并对话片段...")
     conversations = merge_conversation_parts(raw_data)
 
-    # 转换格式
     print("转换格式...")
     result = convert_to_openai_format(
         conversations,
         min_turns=args.min_turns,
         max_turns=args.max_turns,
+        min_user_turns=args.min_user_turns,
     )
 
-    # 按策略选择输出子集
     result = select_conversations(
         result,
         count=args.count,
@@ -245,13 +231,11 @@ def main():
         seed=args.seed,
     )
 
-    # 打印统计
     print_stats(result)
 
-    # 保存
     print(f"\n保存到: {args.output}")
-    with open(args.output, "w", encoding="utf-8") as f:
-        json.dump(result, f, ensure_ascii=False, indent=2)
+    with open(args.output, "w", encoding="utf-8") as file:
+        json.dump(result, file, ensure_ascii=False, indent=2)
 
     print("完成!")
 
