@@ -34,15 +34,19 @@ def _group_summary(items: list[RequestResult]) -> dict[str, float]:
 
 def _prompt_bucket(prompt_tokens: int) -> str:
     if prompt_tokens < 1024:
-        return "lt_1k"
+        return "<1k"
     if prompt_tokens < 4096:
-        return "1k_4k"
+        return "1k-4k"
     if prompt_tokens < 8192:
-        return "4k_8k"
-    return "gte_8k"
+        return "4k-8k"
+    return ">=8k"
 
 
-def build_report(results: list[RequestResult], runtime_sec: float) -> MetricsReport:
+def build_report(
+    results: list[RequestResult],
+    runtime_sec: float,
+    skipped_overlong_conversations: int = 0,
+) -> MetricsReport:
     successful = [result for result in results if result.success]
     ttfts = [result.ttft_ms for result in successful]
     prompt_tokens = [result.prompt_tokens for result in successful]
@@ -60,6 +64,7 @@ def build_report(results: list[RequestResult], runtime_sec: float) -> MetricsRep
         p99_ttft_ms=_percentile(ttfts, 0.99),
         mean_prompt_tokens=mean(prompt_tokens) if prompt_tokens else 0.0,
         mean_cached_tokens=mean(cached_tokens) if cached_tokens else 0.0,
+        skipped_overlong_conversations=skipped_overlong_conversations,
     )
 
     by_tier: dict[str, list[RequestResult]] = {}

@@ -76,9 +76,11 @@ class RequestClient:
                         continue
 
                     data = json.loads(chunk)
-                    delta = data.get("choices", [{}])[0].get("delta", {})
-                    if delta.get("content") and ttft_ms is None:
-                        ttft_ms = (time.perf_counter() - start_ts) * 1000.0
+                    choices = data.get("choices") or []
+                    if choices:
+                        delta = choices[0].get("delta", {}) or {}
+                        if delta.get("content") and ttft_ms is None:
+                            ttft_ms = (time.perf_counter() - start_ts) * 1000.0
 
                     usage = data.get("usage") or {}
                     if usage:
@@ -104,6 +106,16 @@ class RequestClient:
                 "generated_tokens": generated_tokens or self.max_tokens,
             }
         except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+            return {
+                "success": False,
+                "error": str(exc),
+                "ttft_ms": 0.0,
+                "latency_ms": 0.0,
+                "prompt_tokens": 0,
+                "cached_tokens": 0,
+                "generated_tokens": 0,
+            }
+        except Exception as exc:  # pragma: no cover - unexpected response shape
             return {
                 "success": False,
                 "error": str(exc),

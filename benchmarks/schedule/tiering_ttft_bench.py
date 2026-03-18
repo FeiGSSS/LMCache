@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import unicodedata
 from dataclasses import asdict
 
 from src.config import build_parser, initialize_randomness
@@ -12,6 +13,40 @@ from src.metrics import build_report
 from src.queue import WeightedReadyQueue
 from src.request_client import RequestClient
 from src.scheduler import BenchmarkScheduler
+from src.tokenizer_utils import PromptLengthValidator
+
+
+def _print_section(title: str) -> None:
+    print("-" * 80)
+    print(title)
+
+
+def _display_width(text: str) -> int:
+    width = 0
+    for char in text:
+        width += 2 if unicodedata.east_asian_width(char) in {"W", "F"} else 1
+    return width
+
+
+def _pad_display(text: str, width: int) -> str:
+    padding = max(0, width - _display_width(text))
+    return text + (" " * padding)
+
+
+def _print_kv(label: str, value: object) -> None:
+    print(f"{_pad_display(label, 24)} {value}")
+
+
+def _print_group_table(title: str, rows: dict[str, dict[str, float]]) -> None:
+    _print_section(title)
+    group_header = _pad_display("分组", 14)
+    print(f"{group_header} {'数量':>8} {'平均TTFT(ms)':>16} {'P90 TTFT(ms)':>16}")
+    for key, stats in sorted(rows.items()):
+        count = int(stats.get("count", 0.0))
+        mean_ttft = stats.get("mean_ttft_ms", 0.0)
+        p90_ttft = stats.get("p90_ttft_ms", 0.0)
+        group_name = _pad_display(key, 14)
+        print(f"{group_name} {count:>8} {mean_ttft:>14.3f} {p90_ttft:>14.3f}")
 
 
 def main() -> None:
@@ -39,6 +74,10 @@ def main() -> None:
         profiles=profiles,
         rng=rng,
     )
+    prompt_validator = PromptLengthValidator(
+        model_path=args.model,
+        max_prompt_tokens=args.max_model_len - args.max_tokens,
+    )
 
     scheduler = BenchmarkScheduler(
         users=users,
@@ -54,42 +93,39 @@ def main() -> None:
         max_num_requests=args.max_num_requests,
         request_rate_per_user=args.request_rate_per_user,
         continue_prob=args.continue_prob,
+        progress_interval_sec=args.progress_interval_sec,
+        prompt_validator=prompt_validator,
+        seed=args.seed,
         rng=rng,
     )
 
     import asyncio
 
     results = asyncio.run(scheduler.run())
-    report = build_report(results=results, runtime_sec=scheduler.runtime_sec)
+    report = build_report(
+        results=results,
+        runtime_sec=scheduler.runtime_sec,
+        skipped_overlong_conversations=scheduler.skipped_overlong_conversations,
+    )
 
-    print("-" * 80)
-    print("Tiering TTFT Benchmark Summary")
-    print("-" * 80)
-    print(f"total_requests     : {report.summary.total_requests}")
-    print(f"succeeded_requests : {report.summary.succeeded_requests}")
-    print(f"failed_requests    : {report.summary.failed_requests}")
-    print(f"runtime_sec        : {report.summary.runtime_sec:.3f}")
-    print(f"requests_per_sec   : {report.summary.requests_per_sec:.3f}")
-    print(f"mean_ttft_ms       : {report.summary.mean_ttft_ms:.3f}")
-    print(f"p50_ttft_ms        : {report.summary.p50_ttft_ms:.3f}")
-    print(f"p90_ttft_ms        : {report.summary.p90_ttft_ms:.3f}")
-    print(f"p99_ttft_ms        : {report.summary.p99_ttft_ms:.3f}")
-    print(f"mean_prompt_tokens : {report.summary.mean_prompt_tokens:.3f}")
-    print(f"mean_cached_tokens : {report.summary.mean_cached_tokens:.3f}")
+    _print_section("多层调度 TTFT Benchmark 汇总")
+    _print_kv("总请求数", report.summary.total_requests)
+    _print_kv("成功请求数", report.summary.succeeded_requests)
+    _print_kv("失败请求数", report.summary.failed_requests)
+    _print_kv("总运行时间(秒)", f"{report.summary.runtime_sec:.3f}")
+    _print_kv("吞吐(req/s)", f"{report.summary.requests_per_sec:.3f}")
+    _print_kv("平均TTFT(ms)", f"{report.summary.mean_ttft_ms:.3f}")
+    _print_kv("P50 TTFT(ms)", f"{report.summary.p50_ttft_ms:.3f}")
+    _print_kv("P90 TTFT(ms)", f"{report.summary.p90_ttft_ms:.3f}")
+    _print_kv("P99 TTFT(ms)", f"{report.summary.p99_ttft_ms:.3f}")
+    _print_kv("平均Prompt Tokens", f"{report.summary.mean_prompt_tokens:.3f}")
+    _print_kv("平均缓存Tokens", f"{report.summary.mean_cached_tokens:.3f}")
+    _print_kv("超长跳过会话数", report.summary.skipped_overlong_conversations)
 
     if not args.print_summary_only:
-        print("-" * 80)
-        print("By Tier")
-        for tier, stats in sorted(report.by_tier.items()):
-            print(f"{tier}: {stats}")
-        print("-" * 80)
-        print("By Selection Reason")
-        for reason, stats in sorted(report.by_reason.items()):
-            print(f"{reason}: {stats}")
-        print("-" * 80)
-        print("By Prompt Bucket")
-        for bucket, stats in sorted(report.prompt_buckets.items()):
-            print(f"{bucket}: {stats}")
+        _print_group_table("按用户档位统计", report.by_tier)
+        _print_group_table("按会话选择方式统计", report.by_reason)
+        _print_group_table("按Prompt长度分桶统计", report.prompt_buckets)
 
     if args.output_file is not None:
         with open(args.output_file, "w", encoding="utf-8") as file:

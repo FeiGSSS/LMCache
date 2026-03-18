@@ -44,7 +44,9 @@ async def schedule_user_request(
     continue_prob: float,
     request_rate_per_user: float,
     rng: random.Random,
+    prompt_validator,
     enqueue_callback,
+    on_skip_conversation,
     stop_event: asyncio.Event,
 ) -> None:
     if stop_event.is_set() or not user.has_available_conversation():
@@ -83,4 +85,22 @@ async def schedule_user_request(
         enqueue_ts=time.perf_counter(),
         selection_reason=selection_reason,
     )
+
+    if prompt_validator.is_prompt_too_long(request.messages):
+        conversation.mark_exhausted()
+        user.current_request_id = None
+        user.state = UserStateName.IDLE
+        on_skip_conversation()
+        await schedule_user_request(
+            user=user,
+            continue_prob=continue_prob,
+            request_rate_per_user=0.0,
+            rng=rng,
+            prompt_validator=prompt_validator,
+            enqueue_callback=enqueue_callback,
+            on_skip_conversation=on_skip_conversation,
+            stop_event=stop_event,
+        )
+        return
+
     await enqueue_callback(request)

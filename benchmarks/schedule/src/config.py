@@ -57,7 +57,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--active-weight", type=float, default=3.0)
     parser.add_argument("--normal-weight", type=float, default=1.0)
     parser.add_argument("--max-tokens", type=int, default=1)
+    parser.add_argument(
+        "--max-model-len",
+        type=int,
+        default=40960,
+        help="Model context length used to guard prompt construction",
+    )
     parser.add_argument("--request-timeout-sec", type=int, default=120)
+    parser.add_argument(
+        "--progress-interval-sec",
+        type=float,
+        default=2.0,
+        help="Interval for progress logs during the benchmark",
+    )
     parser.add_argument(
         "--print-summary-only",
         action="store_true",

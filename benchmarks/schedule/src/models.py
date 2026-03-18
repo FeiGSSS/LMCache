@@ -46,6 +46,9 @@ class ConversationState:
     def count_user_turns(self) -> int:
         return sum(1 for message in self.messages if message["role"] == "user")
 
+    def mark_exhausted(self) -> None:
+        self.next_user_message_index = len(self.messages)
+
 
 @dataclass(slots=True)
 class UserProfile:
@@ -128,6 +131,7 @@ class RunSummary:
     p99_ttft_ms: float
     mean_prompt_tokens: float
     mean_cached_tokens: float
+    skipped_overlong_conversations: int
 
 
 @dataclass(slots=True)
