@@ -162,14 +162,6 @@ Interpretation:
 * recently-hit chunks are favored
 * frequently-hit chunks are favored
 
-The promotion threshold also uses a margin:
-
-.. code-block:: text
-
-   disk_score > cpu_score + HOTNESS_PROMOTION_MARGIN
-
-The current promotion margin is ``0.05``.
-
 Hotness State Lifecycle
 -----------------------
 
@@ -336,7 +328,7 @@ Algorithm:
 2. select the coldest keys in ``Tier.CPU``
 3. for each hot disk key:
 
-   * find a CPU victim that is colder by at least the promotion margin
+   * find a CPU victim that is colder than or equal to the disk key
    * require that the CPU victim is also resident on disk
    * replace the CPU victim with the disk key
 

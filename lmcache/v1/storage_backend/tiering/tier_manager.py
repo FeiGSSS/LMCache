@@ -20,8 +20,6 @@ class Tier(Enum):
     CPU = auto()
     DISK = auto()
 
-PROMOTION_MARGIN = 0.05
-
 if TYPE_CHECKING:
     # First Party
     from lmcache.v1.storage_backend.storage_manager import StorageManager
