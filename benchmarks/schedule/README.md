@@ -9,6 +9,7 @@
 - `benchmarks/schedule/lmcache_baseline.yaml`：LMCache 配置（当前 `max_local_cpu_size: 80`）
 - `benchmarks/schedule/tiering_ttft_bench.py`：面向多层调度的 TTFT benchmark
 - `benchmarks/schedule/tiering_ttft_benchmark_design.md`：TTFT benchmark 设计文档
+- `benchmarks/schedule/schedule_benchmark_mechanism.md`：面向他人讲解 benchmark 机制的说明文档
 
 ## Step 0: 前置检查
 
