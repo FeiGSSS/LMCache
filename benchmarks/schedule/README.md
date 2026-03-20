@@ -125,6 +125,71 @@ curl -X POST "http://localhost:$PORT/reset_prefix_cache?reset_connector=true"
 
 这一部分用于测试多层缓存调度对 TTFT 的影响。
 
+### 已知 CPU+Disk+tiering 卡住问题复现命令
+
+下面这组命令用于复现当前讨论中的 `vLLM + LMCache + CPU+Disk+tiering`
+卡住问题。现象是服务不立即崩溃，但 benchmark 会在大量 in-flight 请求时停止推进。
+
+先启动服务：
+
+```bash
+CUDA_VISIBLE_DEVICES=2 \
+VLLM_SERVER_DEV_MODE=1 \
+LMCACHE_CHUNK_SIZE=256 \
+LMCACHE_LOCAL_CPU=True \
+LMCACHE_MAX_LOCAL_CPU_SIZE=30 \
+LMCACHE_LOCAL_DISK=file:///tmp/lmcache_schedule_disk/ \
+LMCACHE_MAX_LOCAL_DISK_SIZE=120 \
+LMCACHE_ENABLE_TIERING=True \
+vllm serve /data/llm-models/Qwen3-8B \
+  --served-model-name Qwen3-8B \
+  --port 8002 \
+  --tensor-parallel-size 1 \
+  --gpu-memory-utilization 0.4 \
+  --enable-prompt-tokens-details \
+  --kv-transfer-config '{"kv_connector":"LMCacheConnectorV1","kv_role":"kv_both"}'
+```
+
+然后运行 benchmark：
+
+```bash
+python3 benchmarks/schedule/tiering_ttft_bench.py \
+  --model /data/llm-models/Qwen3-8B \
+  --served-model-name Qwen3-8B \
+  --url http://localhost:8002 \
+  --input-file benchmarks/schedule/dataset/sharegpt_conv_all_min5.json \
+  --num-users 128 \
+  --conversations-per-user 10 \
+  --min-user-turns 5 \
+  --max-parallel 32 \
+  --request-rate-per-user 1 \
+  --continue-prob 0.8 \
+  --seed 42 \
+  --max-num-requests 7000 \
+  --output-file benchmarks/schedule/results/tiering_ttft_vllm_full.json
+```
+
+更快的调试复现版本：
+
+```bash
+python3 benchmarks/schedule/tiering_ttft_bench.py \
+  --model /data/llm-models/Qwen3-8B \
+  --served-model-name Qwen3-8B \
+  --url http://localhost:8002 \
+  --input-file benchmarks/schedule/dataset/sharegpt_conv_all_min5.json \
+  --num-users 128 \
+  --conversations-per-user 10 \
+  --min-user-turns 5 \
+  --max-parallel 32 \
+  --request-rate-per-user 1 \
+  --continue-prob 0.8 \
+  --seed 42 \
+  --max-num-requests 2200 \
+  --output-file benchmarks/schedule/results/tiering_ttft_debug_2200.json
+```
+
+建议同时保存服务日志，方便对齐 stall 时刻和 LMCache pin timeout。
+
 这个 benchmark 的核心建模是：
 
 - 一个 `user` 表示一个真实用户，而不是一个简单发送器
