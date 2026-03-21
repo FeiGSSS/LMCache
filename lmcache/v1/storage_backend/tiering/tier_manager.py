@@ -63,7 +63,6 @@ class TierManager:
         self._stop_event = Event()
         self._thread: Optional[Thread] = None
         self._state_lock = Lock()
-        self._pressure_lock = Lock()
 
         # Backend references (set in setup_backend_hooks).
         self._cpu_backend: "LocalCPUBackend"
@@ -224,66 +223,74 @@ class TierManager:
         """
         Run one promotion-management iteration: promote hot disk-only
         keys by replacing colder CPU keys.
+
+        No outer lock is needed here — all shared state is protected by
+        fine-grained locks in HotnessPolicy (RLock), LocalCPUBackend
+        (cpu_lock), and LocalDiskBackend (disk_lock).  TOCTOU races
+        (e.g. a victim evicted between selection and action) are handled
+        gracefully: ``remove_if_evictable`` returns ``False`` and the
+        promotion is simply skipped.
         """
-        with self._pressure_lock:
-            now = time()
+        now = time()
 
-            disk_candidates = self.hotness_policy.select_hottest(
-                Tier.DISK,
-                limit=self.max_actions_per_tick,
-                require_absent_in=Tier.CPU,
-                now=now,
-            )
-            if not disk_candidates:
-                return
+        disk_candidates = self.hotness_policy.select_hottest(
+            Tier.DISK,
+            limit=self.max_actions_per_tick,
+            require_absent_in=Tier.CPU,
+            now=now,
+        )
+        if not disk_candidates:
+            return
 
-            cpu_candidates = self.hotness_policy.select_coldest(
-                Tier.CPU,
-                limit=self.max_actions_per_tick,
-                now=now,
-            )
-            if not cpu_candidates:
-                return
+        cpu_candidates = self.hotness_policy.select_coldest(
+            Tier.CPU,
+            limit=self.max_actions_per_tick,
+            now=now,
+        )
+        if not cpu_candidates:
+            return
 
-            logger.debug(
-                "Promotion candidates: disk_hot=%d cpu_cold=%d",
-                len(disk_candidates),
-                len(cpu_candidates),
-            )
+        logger.debug(
+            "Promotion candidates: disk_hot=%d cpu_cold=%d",
+            len(disk_candidates),
+            len(cpu_candidates),
+        )
 
-            used_cpu_keys: set[CacheEngineKey] = set()
+        used_cpu_keys: set[CacheEngineKey] = set()
 
-            for disk_key, disk_score in disk_candidates:
-                victim_key: Optional[CacheEngineKey] = None
+        for disk_key, disk_score in disk_candidates:
+            victim_key: Optional[CacheEngineKey] = None
 
-                # Iterate hottest-first so we replace the warmest eligible
-                # CPU key, leaving colder ones for less-hot disk keys.
-                for cpu_key, cpu_score in reversed(cpu_candidates):
-                    if cpu_key in used_cpu_keys:
-                        continue
-                    if disk_score < cpu_score:
-                        continue
-                    # disk ⊇ CPU invariant: skip if disk copy is missing
-                    # (should not happen under normal operation)
-                    state = self.hotness_policy.get_state(cpu_key)
-                    if state is None or Tier.DISK not in state.resident_tiers:
-                        continue
-                    victim_key = cpu_key
-                    break
-
-                if victim_key is None:
+            # Iterate hottest-first so we replace the warmest eligible
+            # CPU key, leaving colder ones for less-hot disk keys.
+            for cpu_key, cpu_score in reversed(cpu_candidates):
+                if cpu_key in used_cpu_keys:
                     continue
+                if disk_score < cpu_score:
+                    continue
+                # disk ⊇ CPU invariant: skip if disk copy is missing
+                # (should not happen under normal operation)
+                state = self.hotness_policy.get_state(cpu_key)
+                if state is None or Tier.DISK not in state.resident_tiers:
+                    continue
+                victim_key = cpu_key
+                break
 
-                if self.replace_promote_key(disk_key, victim_key):
-                    used_cpu_keys.add(victim_key)
-                    logger.debug(
-                        "Promoted %s (replacing %s)", disk_key, victim_key
-                    )
+            if victim_key is None:
+                continue
+
+            if self.replace_promote_key(disk_key, victim_key):
+                used_cpu_keys.add(victim_key)
+                logger.debug(
+                    "Promoted %s (replacing %s)", disk_key, victim_key
+                )
 
     def ensure_cpu_headroom(self) -> bool:
         """
         Demote coldest CPU-resident keys until usage drops below the low
         watermark.  Called by the CPU backend pressure handler.
+
+        No outer lock — same rationale as ``run_once``.
         """
         cpu = self._cpu_backend
         if cpu.capacity_bytes <= 0:
@@ -292,13 +299,12 @@ class TierManager:
         target = int(cpu.capacity_bytes * self.cpu_low_watermark)
         relieved = False
 
-        with self._pressure_lock:
-            candidates = self.hotness_policy.select_coldest(Tier.CPU)
-            for key, _ in candidates:
-                if cpu.usage_bytes <= target:
-                    break
-                if self.demote_key(key):
-                    relieved = True
+        candidates = self.hotness_policy.select_coldest(Tier.CPU)
+        for key, _ in candidates:
+            if cpu.usage_bytes <= target:
+                break
+            if self.demote_key(key):
+                relieved = True
 
         return relieved
 

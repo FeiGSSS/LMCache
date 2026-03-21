@@ -5,7 +5,7 @@ import heapq
 from dataclasses import dataclass, field
 from enum import EnumType
 from math import exp, log1p
-from threading import RLock
+from threading import Lock
 from time import time
 from typing import Hashable, Optional
 
@@ -46,7 +46,7 @@ class HotnessPolicy:
         self._tier_keys: dict[Hashable, set[CacheEngineKey]] = {
             t: set() for t in tier_enum
         }
-        self._lock = RLock()
+        self._lock = Lock()
 
     def _get_or_create_state(
         self,
