@@ -49,8 +49,6 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 DEFAULT_TIER_MANAGER_INTERVAL_SECS = 1.0
-DEFAULT_CPU_HIGH_WATERMARK = 0.90
-DEFAULT_CPU_LOW_WATERMARK = 0.80
 DEFAULT_MAX_ACTIONS_PER_TICK = 8
 
 
@@ -58,17 +56,15 @@ class TierManager:
     """
     Manage periodic disk-to-CPU promotion across storage tiers.
 
-    CPU demotion is event-driven through ``ensure_cpu_headroom()`` via the
-    LocalCPU pressure handler. The background loop only refreshes hotness aging
-    and evaluates replacement promotions.
+    CPU eviction is handled by the backend's native LRU policy.
+    The background loop refreshes hotness clock decay and evaluates
+    replacement promotions.
     """
 
     def __init__(
         self,
         storage_manager: "StorageManager",
         interval_secs: Optional[float] = None,
-        cpu_high_watermark: float = DEFAULT_CPU_HIGH_WATERMARK,
-        cpu_low_watermark: float = DEFAULT_CPU_LOW_WATERMARK,
         max_actions_per_tick: int = DEFAULT_MAX_ACTIONS_PER_TICK,
     ) -> None:
         self.storage_manager = storage_manager
@@ -78,8 +74,6 @@ class TierManager:
             if interval_secs is None
             else interval_secs
         )
-        self.cpu_high_watermark = cpu_high_watermark
-        self.cpu_low_watermark = cpu_low_watermark
         self.max_actions_per_tick = max_actions_per_tick
 
         self._stop_event = Event()
@@ -92,8 +86,6 @@ class TierManager:
 
         # Tiering event counters
         self._promote_count = 0
-        self._demote_count = 0
-        self._pressure_count = 0
         self._tick_count = 0
         self._start_ts = time()
 
@@ -113,10 +105,8 @@ class TierManager:
             )
             self._thread.start()
             tiering_log.info(
-                "START\tinterval=%.2fs\tcpu_high=%.2f\tcpu_low=%.2f\t"
-                "max_actions=%d",
-                self.interval_secs, self.cpu_high_watermark,
-                self.cpu_low_watermark, self.max_actions_per_tick,
+                "START\tinterval=%.2fs\tmax_actions=%d",
+                self.interval_secs, self.max_actions_per_tick,
             )
 
     def stop(self) -> None:
@@ -324,47 +314,6 @@ class TierManager:
                     "Promoted %s (replacing %s)", disk_key, victim_key
                 )
 
-    def ensure_cpu_headroom(self) -> bool:
-        """
-        Demote coldest CPU-resident keys until usage drops below the low
-        watermark.  Called by the CPU backend pressure handler.
-
-        No outer lock — same rationale as ``run_once``.
-        """
-        cpu = self._cpu_backend
-        if cpu.capacity_bytes <= 0:
-            return False
-
-        self._pressure_count += 1
-        usage_before = cpu.usage_bytes
-        target = int(cpu.capacity_bytes * self.cpu_low_watermark)
-        relieved = False
-        demoted_in_round = 0
-
-        candidates = self.hotness_policy.select_coldest(Tier.CPU)
-        for key, score in candidates:
-            if cpu.usage_bytes <= target:
-                break
-            if self.demote_key(key):
-                relieved = True
-                demoted_in_round += 1
-                tiering_log.info(
-                    "DEMOTE\t%s\tscore=%.4f\tcpu_usage=%.1fMB",
-                    key, score, cpu.usage_bytes / 1e6,
-                )
-
-        tiering_log.info(
-            "PRESSURE\tdemoted=%d\tcpu_before=%.1fMB\tcpu_after=%.1fMB\t"
-            "target=%.1fMB\tcapacity=%.1fMB",
-            demoted_in_round,
-            usage_before / 1e6,
-            cpu.usage_bytes / 1e6,
-            target / 1e6,
-            cpu.capacity_bytes / 1e6,
-        )
-
-        return relieved
-
     def replace_promote_key(
         self,
         disk_key: CacheEngineKey,
@@ -393,24 +342,6 @@ class TierManager:
         memory_obj.ref_count_down()
         return promoted
 
-    def demote_key(self, key: CacheEngineKey) -> bool:
-        """
-        Demote key from CPU: remove CPU copy (disk already has it per
-        the disk ⊇ CPU invariant).
-        """
-        state = self.hotness_policy.get_state(key)
-        if state is None or Tier.CPU not in state.resident_tiers:
-            logger.error("demote_key: invalid state for key %s: %s", key, state)
-            return False
-        if Tier.DISK not in state.resident_tiers:
-            return False
-
-        if not self._cpu_backend.remove_if_evictable(key):
-            return False
-        self.hotness_policy.remove_resident(key, Tier.CPU)
-        self._demote_count += 1
-        return True
-
     def _log_summary(self) -> None:
         cpu_keys = len(self.hotness_policy.get_keys_in_tier(Tier.CPU))
         disk_keys = len(self.hotness_policy.get_keys_in_tier(Tier.DISK))
@@ -419,10 +350,9 @@ class TierManager:
         cpu_cap = getattr(self._cpu_backend, "capacity_bytes", 0)
         tiering_log.info(
             "SUMMARY\tt=%.1fs\ttick=%d\tcpu_keys=%d\tdisk_keys=%d\t"
-            "promotes=%d\tdemotes=%d\tpressures=%d\t"
-            "cpu_usage=%.1fMB/%.1fMB",
+            "promotes=%d\tcpu_usage=%.1fMB/%.1fMB",
             elapsed, self._tick_count, cpu_keys, disk_keys,
-            self._promote_count, self._demote_count, self._pressure_count,
+            self._promote_count,
             cpu_usage / 1e6, cpu_cap / 1e6,
         )
 
