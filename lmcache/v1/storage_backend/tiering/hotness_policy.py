@@ -4,9 +4,7 @@ import copy
 import heapq
 from dataclasses import dataclass, field
 from enum import EnumType
-from math import exp, log1p
 from threading import Lock
-from time import time
 from typing import Hashable, Optional
 
 # First Party
@@ -15,21 +13,13 @@ from lmcache.utils import CacheEngineKey
 
 logger = init_logger(__name__)
 
-HIT_CAP = 32
-PREFIX_DECAY = 16.0
-AGE_DECAY = 32.0
-
-PREFIX_WEIGHT = 0.45
-AGE_WEIGHT = 0.35
-HIT_WEIGHT = 0.20
+CLOCK_MAX = 255
 
 
 @dataclass
 class HotnessState:
-    prefix_pos: int
-    hit_count: int
-    insert_ts: float
-    last_hit_ts: float
+    frequency: int
+    clock: int
     resident_tiers: set = field(default_factory=set)
 
 
@@ -51,8 +41,6 @@ class HotnessPolicy:
     def _get_or_create_state(
         self,
         key: CacheEngineKey,
-        timestamp: float,
-        prefix_pos: int = 0,
     ) -> HotnessState:
         """
         Return the existing state for *key*, or create and register a new one.
@@ -62,10 +50,8 @@ class HotnessPolicy:
         state = self._states.get(key)
         if state is None:
             state = HotnessState(
-                prefix_pos=max(prefix_pos, 0),
-                hit_count=0,
-                insert_ts=timestamp,
-                last_hit_ts=timestamp,
+                frequency=1,
+                clock=CLOCK_MAX,
             )
             self._states[key] = state
         return state
@@ -73,20 +59,18 @@ class HotnessPolicy:
     def observe_put(
         self,
         key: CacheEngineKey,
-        prefix_pos: int,
+        prefix_pos: int = 0,
         now: Optional[float] = None,
     ) -> None:
         """
         Record a store event and initialize hotness state if needed.
         """
-        timestamp = time() if now is None else now
         with self._lock:
             state = self._states.get(key)
             if state is None:
-                self._get_or_create_state(key, timestamp, prefix_pos=prefix_pos)
+                self._get_or_create_state(key)
                 return
-            state.prefix_pos = min(state.prefix_pos, max(prefix_pos, 0))
-            state.last_hit_ts = timestamp
+            state.clock = CLOCK_MAX
 
     def observe_get(
         self,
@@ -96,11 +80,10 @@ class HotnessPolicy:
         """
         Record a cache hit for ``key``.
         """
-        timestamp = time() if now is None else now
         with self._lock:
-            state = self._get_or_create_state(key, timestamp)
-            state.hit_count += 1
-            state.last_hit_ts = timestamp
+            state = self._get_or_create_state(key)
+            state.frequency += 1
+            state.clock = CLOCK_MAX
 
     def add_resident(
         self,
@@ -184,12 +167,11 @@ class HotnessPolicy:
         """
         Get the current hotness score for ``key``.
         """
-        timestamp = time() if now is None else now
         with self._lock:
             state = self._states.get(key)
             if state is None:
                 return 0.0
-            return self._compute_score(state, timestamp)
+            return self._compute_score(state)
 
     def get_keys_in_tier(self, tier: Hashable) -> list[CacheEngineKey]:
         """
@@ -236,6 +218,18 @@ class HotnessPolicy:
             return sorted(scored, key=lambda p: p[1], reverse=True)
         return heapq.nlargest(limit, scored, key=lambda p: p[1])
 
+    def tick_clocks(self) -> None:
+        """
+        Exponentially decay the clock of every tracked key.
+
+        Each tick: clock = clock * 15 // 16  (half-life ≈ 11 ticks)
+
+        Called periodically by TierManager's background loop (default 1s).
+        """
+        with self._lock:
+            for state in self._states.values():
+                state.clock = state.clock * 15 // 16
+
     def _score_tier(
         self,
         tier: Hashable,
@@ -243,7 +237,6 @@ class HotnessPolicy:
         exclude: Optional[set[CacheEngineKey]] = None,
         now: Optional[float] = None,
     ) -> list[tuple[CacheEngineKey, float]]:
-        timestamp = time() if now is None else now
         excluded = exclude or set()
         with self._lock:
             scored = []
@@ -257,17 +250,9 @@ class HotnessPolicy:
                 ):
                     continue
                 scored.append(
-                    (key, self._compute_score(state, timestamp))
+                    (key, self._compute_score(state))
                 )
             return scored
 
-    def _compute_score(self, state: HotnessState, now: float) -> float:
-        prefix_score = exp(-state.prefix_pos / PREFIX_DECAY)
-        age_secs = max(now - state.last_hit_ts, 0.0)
-        age_score = exp(-age_secs / AGE_DECAY)
-        hit_score = min(log1p(state.hit_count) / log1p(HIT_CAP), 1.0)
-        return (
-            PREFIX_WEIGHT * prefix_score
-            + AGE_WEIGHT * age_score
-            + HIT_WEIGHT * hit_score
-        )
+    def _compute_score(self, state: HotnessState) -> float:
+        return state.frequency * state.clock

@@ -325,6 +325,8 @@ class LocalCPUBackend(AllocatorBackendInterface):
             self.cache_policy.update_on_force_evict(key)
             self.cpu_lock.release()
 
+        self._notify_internal_evict(key)
+
         if self.batched_msg_sender is not None:
             self.batched_msg_sender.add_kv_op(
                 op_type=OpType.EVICT,

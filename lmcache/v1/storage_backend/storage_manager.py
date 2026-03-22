@@ -541,8 +541,7 @@ class StorageManager:
                     self.tier_manager.observe_get(key)
             results.extend(memory_objs)
 
-            # Align with single-key `get()` logic:
-            # auto-write non-CPU results back into local CPU cache.
+            # Auto-write non-CPU results back into local CPU cache.
             if (
                 backend_name not in ["LocalCPUBackend", "PDBackend"]
                 and self.local_cpu_backend is not None

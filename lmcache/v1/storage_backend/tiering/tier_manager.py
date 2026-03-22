@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
+import logging
+import os
 from enum import Enum, auto
 from functools import partial
 from threading import Event, Lock, Thread
@@ -10,6 +12,26 @@ from typing import TYPE_CHECKING, Callable, Optional, Sequence
 from lmcache.logging import init_logger
 from lmcache.utils import CacheEngineKey
 from lmcache.v1.storage_backend.tiering.hotness_policy import HotnessPolicy
+
+TIERING_LOG_PATH = os.environ.get(
+    "LMCACHE_TIERING_LOG", "/tmp/lmcache_tiering.log"
+)
+
+
+def _init_tiering_logger() -> logging.Logger:
+    tlog = logging.getLogger("lmcache.tiering.events")
+    tlog.handlers.clear()
+    tlog.propagate = False
+    fh = logging.FileHandler(TIERING_LOG_PATH, mode="w")
+    fh.setFormatter(
+        logging.Formatter("%(asctime)s\t%(message)s", datefmt="%H:%M:%S")
+    )
+    tlog.addHandler(fh)
+    tlog.setLevel(logging.DEBUG)
+    return tlog
+
+
+tiering_log = _init_tiering_logger()
 
 if TYPE_CHECKING:
     from lmcache.v1.storage_backend.local_cpu_backend import LocalCPUBackend
@@ -68,6 +90,13 @@ class TierManager:
         self._cpu_backend: "LocalCPUBackend"
         self._disk_backend: "LocalDiskBackend"
 
+        # Tiering event counters
+        self._promote_count = 0
+        self._demote_count = 0
+        self._pressure_count = 0
+        self._tick_count = 0
+        self._start_ts = time()
+
     def start(self) -> None:
         """
         Start the background tier-management loop.
@@ -76,12 +105,19 @@ class TierManager:
             if self._thread is not None and self._thread.is_alive():
                 return
             self._stop_event.clear()
+            self._start_ts = time()
             self._thread = Thread(
                 target=self._run_loop,
                 name="storage-tier-manager",
                 daemon=True,
             )
             self._thread.start()
+            tiering_log.info(
+                "START\tinterval=%.2fs\tcpu_high=%.2f\tcpu_low=%.2f\t"
+                "max_actions=%d",
+                self.interval_secs, self.cpu_high_watermark,
+                self.cpu_low_watermark, self.max_actions_per_tick,
+            )
 
     def stop(self) -> None:
         """
@@ -97,6 +133,8 @@ class TierManager:
 
         if thread.is_alive():
             thread.join(timeout=10.0)
+        self._log_summary()
+        tiering_log.info("STOP")
 
     def is_running(self) -> bool:
         """
@@ -195,12 +233,9 @@ class TierManager:
         self._cpu_backend = lcb
         self._disk_backend = ldb
 
-        # Setup CPU pressure handler
-        self._cpu_backend.set_pressure_handler(
-            self.ensure_cpu_headroom,
-            high_watermark=self.cpu_high_watermark,
-            low_watermark=self.cpu_low_watermark,
-        )
+        # CPU eviction is handled by the backend's native LRU policy.
+        # TierManager only needs evict callbacks to keep hotness tracking
+        # consistent, and the background thread for promotion.
 
         # Setup evict callbacks
         self._cpu_backend.set_internal_evict_callback(
@@ -212,7 +247,6 @@ class TierManager:
 
     def teardown_backend_hooks(self, backend_name: Optional[str] = None) -> None:
         if backend_name is None or backend_name == "LocalCPUBackend":
-            self._cpu_backend.set_pressure_handler(None)
             self._cpu_backend.set_internal_evict_callback(None)
         if backend_name is None or backend_name == "LocalDiskBackend":
             self._disk_backend.set_internal_evict_callback(None)
@@ -266,7 +300,7 @@ class TierManager:
             for cpu_key, cpu_score in reversed(cpu_candidates):
                 if cpu_key in used_cpu_keys:
                     continue
-                if disk_score < cpu_score:
+                if disk_score <= cpu_score:
                     continue
                 # disk ⊇ CPU invariant: skip if disk copy is missing
                 # (should not happen under normal operation)
@@ -281,6 +315,11 @@ class TierManager:
 
             if self.replace_promote_key(disk_key, victim_key):
                 used_cpu_keys.add(victim_key)
+                self._promote_count += 1
+                tiering_log.info(
+                    "PROMOTE\t%s\tscore=%.4f\tvictim=%s\tvictim_score=%.4f",
+                    disk_key, disk_score, victim_key, cpu_score,
+                )
                 logger.debug(
                     "Promoted %s (replacing %s)", disk_key, victim_key
                 )
@@ -296,15 +335,33 @@ class TierManager:
         if cpu.capacity_bytes <= 0:
             return False
 
+        self._pressure_count += 1
+        usage_before = cpu.usage_bytes
         target = int(cpu.capacity_bytes * self.cpu_low_watermark)
         relieved = False
+        demoted_in_round = 0
 
         candidates = self.hotness_policy.select_coldest(Tier.CPU)
-        for key, _ in candidates:
+        for key, score in candidates:
             if cpu.usage_bytes <= target:
                 break
             if self.demote_key(key):
                 relieved = True
+                demoted_in_round += 1
+                tiering_log.info(
+                    "DEMOTE\t%s\tscore=%.4f\tcpu_usage=%.1fMB",
+                    key, score, cpu.usage_bytes / 1e6,
+                )
+
+        tiering_log.info(
+            "PRESSURE\tdemoted=%d\tcpu_before=%.1fMB\tcpu_after=%.1fMB\t"
+            "target=%.1fMB\tcapacity=%.1fMB",
+            demoted_in_round,
+            usage_before / 1e6,
+            cpu.usage_bytes / 1e6,
+            target / 1e6,
+            cpu.capacity_bytes / 1e6,
+        )
 
         return relieved
 
@@ -351,12 +408,33 @@ class TierManager:
         if not self._cpu_backend.remove_if_evictable(key):
             return False
         self.hotness_policy.remove_resident(key, Tier.CPU)
+        self._demote_count += 1
         return True
 
+    def _log_summary(self) -> None:
+        cpu_keys = len(self.hotness_policy.get_keys_in_tier(Tier.CPU))
+        disk_keys = len(self.hotness_policy.get_keys_in_tier(Tier.DISK))
+        elapsed = time() - self._start_ts
+        cpu_usage = getattr(self._cpu_backend, "usage_bytes", 0)
+        cpu_cap = getattr(self._cpu_backend, "capacity_bytes", 0)
+        tiering_log.info(
+            "SUMMARY\tt=%.1fs\ttick=%d\tcpu_keys=%d\tdisk_keys=%d\t"
+            "promotes=%d\tdemotes=%d\tpressures=%d\t"
+            "cpu_usage=%.1fMB/%.1fMB",
+            elapsed, self._tick_count, cpu_keys, disk_keys,
+            self._promote_count, self._demote_count, self._pressure_count,
+            cpu_usage / 1e6, cpu_cap / 1e6,
+        )
+
     def _run_loop(self) -> None:
+        summary_interval = 10  # log summary every N ticks
         while not self._stop_event.is_set():
             try:
+                self._tick_count += 1
+                self.hotness_policy.tick_clocks()
                 self.run_once()
+                if self._tick_count % summary_interval == 0:
+                    self._log_summary()
             except Exception:
                 logger.exception("TierManager iteration failed")
             self._stop_event.wait(self.interval_secs)
